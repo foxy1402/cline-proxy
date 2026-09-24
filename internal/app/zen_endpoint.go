@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,48 +10,43 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"cline-go-proxy/internal/kit"
 )
 
-// ============ zen 端点自适应（endpoint auto-learn） ============
+// ============ zen endpoint auto-learning ============
 //
-// 背景：zen 免费层每个模型只服务一个原生端点（/chat/completions 或
-// /v1/responses；官方 CLI 按模型分别只发其中之一）。网关事先不知道新模型的
-// 端点——公共目录无该信号（29 个免费模型中 23 个无 provider 字段），唯一可靠
-// 信号是上游拒绝本身：走错端点时上游报 500/400 + 端点错误特征。
+// Background: Each model in the zen free tier only serves on one native endpoint
+// (/chat/completions or /v1/responses; official CLI only queries one endpoint per model).
+// The gateway cannot predict a model's endpoint beforehand since the public catalog
+// provides no signal (23 of 29 free models have no provider field). The only reliable
+// signal is upstream rejection: querying the wrong endpoint yields 500/400 with
+// endpoint-specific error signatures.
 //
-// 机制：Upstream=="" 的模型先走 chat/completions（默认路径，零探测开销）；
-// 若上游按"走错端点"模式拒绝，learnZenEndpoint 把该模型记为 responses 并
-// 持久化（DATA_DIR/.zen-endpoints.json），本次请求直接改走原生 responses
-// 路径重试。学习结果跨重启保留，后续请求零开销直达。
+// Mechanism: Models with Upstream=="" first query chat/completions (default path, zero probe overhead).
+// If rejected with an endpoint mismatch pattern, learnZenEndpoint marks the model as "responses"
+// and persists it (DATA_DIR/.zen-endpoints.json), and immediately retries via the native responses path.
+// Learned endpoints survive server restarts, allowing future requests to proceed with zero overhead.
 //
-// 已知 responses 模型（muse-spark，Upstream="responses"）不受影响：直达原生
-// 路径，无探测、无重试。
+// Known responses models (e.g., muse-spark, Upstream="responses") route directly
+// to the responses path without probe or retry.
 //
-// 误判防护（v2）：判定只看"上游按 HTTP 拒绝了"——具体状态码 + 响应体特征词，
-// 绝不做整条错误文本的子串匹配。曾经的实现匹配任意错误串，而 DNS 失败的错误
-// 文本是 "dial tcp: lookup ...: no such host"，命中关键词表里的 "no such" 后
-// 会把一次瞬时断网固化成"该模型该走 responses"并持久化（目录同步不会改写既有
-// 条目的 Upstream，不自愈）。纠错口：responses 路径若报反向特征，learn 回 chat。
+// Misclassification guard: Detection strictly evaluates HTTP response codes and
+// error body keywords rather than substring-matching raw network errors (e.g., DNS failures).
+// A reverse check is also included: if responses returns a chat-specific error, it learns back to chat.
 
-// zenEndpointFile 端点学习结果持久化路径。
+// zenEndpointFile returns persistence path for learned endpoints.
 func zenEndpointFile() string {
 	return kit.ResolveDataPath(".zen-endpoints.json")
 }
 
-// zenHTTPError zen 上游返回的非 2xx 答复（携带状态码）。
-// 端点学习必须只依据"上游真的按 HTTP 拒绝了"，而不是错误文本——网络层错误
-//（DNS 解析失败、拨号超时）的错误串里天然含 "no such host" 之类的词，靠子串
-// 匹配会把一次瞬时断网永久固化成"该模型该走 responses"，且写进持久化文件后
-// 目录同步不会自愈。类型化错误让判定只看状态码。
+// zenHTTPError represents non-2xx responses from zen upstream with status code.
 type zenHTTPError struct {
 	Status int
 	Body   string
-	// RateLimited 该错误出自 isRateLimited 分支（429，或关键词命中的 403/502/
-	// 503）。同一状态码可能走完全不同的分支：FreeTier 的"干净" 403 意味着会话
-	// 已死、收割机已触发；带限流关键词的 403 则意味着 key 刚被冷却、收割机
-	// 根本没跑。消费者（如面板 Test）必须据此区分，不能只看 Status。
+	// RateLimited indicates whether this error originated from rate limiting (429, 403, or 502/503).
+	// Distinct from session expiration where sessions are minted afresh.
 	RateLimited bool
 }
 
@@ -58,19 +54,16 @@ func (e *zenHTTPError) Error() string {
 	return fmt.Sprintf("zen API %d: %s", e.Status, e.Body)
 }
 
-// isWrongEndpoint 上游错误是否呈"走错端点"特征。
-// 判定严格基于状态码：
-//   - 500：实测 spark 在 chat 端点上就是裸 500（body 是通用 Internal server error），
-//     这是唯一能识别该模型端点的信号，保留。
-//   - 400/404/405/422：再看 body 是否带路由特征词。
-//   - 其余（含 502/503/504 瞬时网关、429/403 限流会话、以及所有非 zenHTTPError
-//     的网络层错误）：一律不学习。
+// isWrongEndpoint checks if upstream error matches wrong-endpoint signatures.
 func isWrongEndpoint(err error) bool {
 	var he *zenHTTPError
 	if !errors.As(err, &he) {
-		return false // 网络层/序列化/取消等错误：与端点无关
+		return false // Network, timeout, or cancellation errors are not endpoint mismatches
 	}
 	if he.Status == http.StatusInternalServerError {
+		return true
+	}
+	if he.Status == http.StatusServiceUnavailable && strings.Contains(strings.ToLower(he.Body), "endpoint is unavailable") {
 		return true
 	}
 	switch he.Status {
@@ -79,7 +72,7 @@ func isWrongEndpoint(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(he.Body)
-	// 限流/配额/会话类 4xx 走正常重试/换 key，不做端点学习
+	// Rate limits, quotas, and session errors trigger normal retry, not endpoint learning
 	for _, kw := range []string{
 		"freetier", "free tier", "rate limit", "ratelimit", "too many",
 		"overloaded", "busy", "quota", "credit", "payment", "billing",
@@ -89,11 +82,11 @@ func isWrongEndpoint(err error) bool {
 			return false
 		}
 	}
-	// 走错端点特征词（只看 4xx 的响应体，不再看任意错误文本）
+	// Wrong endpoint keywords
 	for _, kw := range []string{
 		"not found", "no such", "unknown model", "unsupported",
 		"invalid endpoint", "wrong endpoint", "use /v1/responses",
-		"use /chat/completions", "endpoint",
+		"use /chat/completions", "endpoint", "endpoint is unavailable",
 	} {
 		if strings.Contains(msg, kw) {
 			return true
@@ -102,8 +95,7 @@ func isWrongEndpoint(err error) bool {
 	return false
 }
 
-// isWrongEndpointResponses 反向特征：responses 路径上报"该用 chat"。
-// 同样只看带状态码的上游答复，避免网络错误误翻转。
+// isWrongEndpointResponses checks for reverse signature: responses endpoint reporting to use chat.
 func isWrongEndpointResponses(err error) bool {
 	var he *zenHTTPError
 	if !errors.As(err, &he) {
@@ -123,8 +115,7 @@ func isWrongEndpointResponses(err error) bool {
 	return false
 }
 
-// learnZenEndpoint 学习并持久化某模型的原生端点（"responses" 或 ""）。
-// 与 applyZenCatalog 同样用副本替换：池内条目一旦发布就不再改写。
+// learnZenEndpoint learns and persists the native endpoint for a model ("responses" or "").
 func learnZenEndpoint(modelID, upstream string) {
 	initZenModels()
 	zenModelsMu.Lock()
@@ -139,7 +130,7 @@ func learnZenEndpoint(modelID, upstream string) {
 	saveZenEndpoints()
 }
 
-// loadZenEndpointsFile 读取学习结果文件（空/损坏 → nil）。
+// loadZenEndpointsFile reads learned endpoints file (returns nil if empty or invalid).
 func loadZenEndpointsFile() map[string]string {
 	data, err := os.ReadFile(zenEndpointFile())
 	if err != nil || len(data) == 0 {
@@ -153,7 +144,7 @@ func loadZenEndpointsFile() map[string]string {
 	return learned
 }
 
-// applyZenEndpoints 把学习结果敷用到模型表上（调用方不持锁）。返回生效条数。
+// applyZenEndpoints applies learned endpoints to models map (caller does not hold lock). Returns applied count.
 func applyZenEndpoints(learned map[string]string) int {
 	if len(learned) == 0 {
 		return 0
@@ -163,7 +154,7 @@ func applyZenEndpoints(learned map[string]string) int {
 	defer zenModelsMu.Unlock()
 	n := 0
 	for id, up := range learned {
-		if up != "responses" && up != "" {
+		if up != "responses" && up != "chat" && up != "" {
 			continue
 		}
 		m, ok := zenModels[id]
@@ -178,7 +169,7 @@ func applyZenEndpoints(learned map[string]string) int {
 	return n
 }
 
-// loadZenEndpoints 启动时恢复学习结果（覆盖种子/目录的 Upstream）。
+// loadZenEndpoints restores learned endpoints on startup.
 func loadZenEndpoints() {
 	learned := loadZenEndpointsFile()
 	if n := applyZenEndpoints(learned); n > 0 {
@@ -186,11 +177,7 @@ func loadZenEndpoints() {
 	}
 }
 
-// reapplyLearnedEndpoints 目录同步后重新敷用学习结果。
-//
-// 启动时 loadZenEndpoints 只覆盖当时已存在的条目：模型目录是首次同步才填进来的
-//（启动顺序上刷新协程与 loadZenEndpoints 并行），同步新增/重建的条目不在视野里。
-// 不同步后补敷用，这些模型每次重启都要重新探测一遍端点。
+// reapplyLearnedEndpoints reapplies learned endpoints after catalog synchronization.
 func reapplyLearnedEndpoints() {
 	learned := loadZenEndpointsFile()
 	if n := applyZenEndpoints(learned); n > 0 {
@@ -198,11 +185,7 @@ func reapplyLearnedEndpoints() {
 	}
 }
 
-// saveZenEndpoints 持久化当前 Upstream 非空的学习结果。
-//
-// 串行化：learnZenEndpoint 由并发请求路径调用，且它在释放 zenModelsMu 之后才走到
-// 这里。两个 goroutine 同时写同一个 .tmp 再 rename，后一次 rename 会对已不存在的
-// tmp 报错，读到半个文件的 loadZenEndpoints 还会把整个学习表当损坏丢掉。
+// saveZenEndpoints persists learned endpoints where Upstream is non-empty.
 var zenEndpointSaveMu sync.Mutex
 
 func saveZenEndpoints() {
@@ -212,7 +195,7 @@ func saveZenEndpoints() {
 	zenModelsMu.RLock()
 	learned := map[string]string{}
 	for id, m := range zenModels {
-		if m != nil && m.Upstream == "responses" && m.Source != "seed" {
+		if m != nil && (m.Upstream == "responses" || m.Upstream == "chat") && m.Source != "seed" {
 			learned[id] = m.Upstream
 		}
 	}
@@ -228,5 +211,114 @@ func saveZenEndpoints() {
 	}
 	if err := os.Rename(tmp, zenEndpointFile()); err != nil {
 		log.Printf("zen endpoints save failed (rename): %v", err)
+	}
+}
+
+// AutoVerifyZenModels probes any active free models that haven't been verified yet.
+func AutoVerifyZenModels(ctx context.Context) (int, int) {
+	initZenModels()
+	zenModelsMu.RLock()
+	var toProbe []string
+	for id, m := range zenModels {
+		if isZenFreeModel(m) && (m.Upstream == "" || m.Upstream == "unknown") {
+			toProbe = append(toProbe, id)
+		}
+	}
+	zenModelsMu.RUnlock()
+
+	verified := 0
+	failed := 0
+
+	for _, id := range toProbe {
+		select {
+		case <-ctx.Done():
+			return verified, failed
+		default:
+		}
+		endpoint, err := probeZenModelEndpoint(ctx, id)
+		if err == nil && endpoint != "" {
+			verified++
+		} else {
+			failed++
+		}
+	}
+
+	if verified > 0 || failed > 0 {
+		log.Printf("zen probe auto-verification complete: %d verified, %d failed", verified, failed)
+	}
+	return verified, failed
+}
+
+func probeZenModelEndpoint(ctx context.Context, modelID string) (string, error) {
+	params := map[string]any{
+		"model": modelID,
+		"messages": []any{
+			map[string]any{"role": "user", "content": "ping"},
+		},
+		"max_tokens": 5,
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	// Step 1: Probe chat/completions first
+	resp1, _, err1 := callZenAPI(probeCtx, params, false)
+	if err1 == nil && resp1 != nil && resp1.StatusCode == http.StatusOK {
+		resp1.Body.Close()
+		learnZenEndpoint(modelID, "chat")
+		log.Printf("zen probe: model %s verified on chat/completions (HTTP 200)", modelID)
+		return "chat", nil
+	}
+	if resp1 != nil {
+		resp1.Body.Close()
+	}
+
+	// Step 2: Fall back to responses
+	resp2, _, err2 := callZenResponsesAPI(probeCtx, params, false)
+	if err2 == nil && resp2 != nil && resp2.StatusCode == http.StatusOK {
+		resp2.Body.Close()
+		learnZenEndpoint(modelID, "responses")
+		log.Printf("zen probe: model %s fallback verified on responses (HTTP 200)", modelID)
+		return "responses", nil
+	}
+	if resp2 != nil {
+		resp2.Body.Close()
+	}
+
+	return "", fmt.Errorf("model %s failed on both endpoints: chat err=%v, responses err=%v", modelID, err1, err2)
+}
+
+// PruneLearnedEndpoints removes entries for models that no longer exist in desired catalog.
+func PruneLearnedEndpoints(desired map[string]bool) {
+	if len(desired) == 0 {
+		return
+	}
+	zenEndpointSaveMu.Lock()
+	defer zenEndpointSaveMu.Unlock()
+
+	learned := loadZenEndpointsFile()
+	if len(learned) == 0 {
+		return
+	}
+
+	changed := false
+	cleaned := make(map[string]string)
+	for id, ep := range learned {
+		if desired[id] {
+			cleaned[id] = ep
+		} else {
+			log.Printf("zen probe: pruned deprecated model %s from learned endpoints", id)
+			changed = true
+		}
+	}
+
+	if changed {
+		data, err := json.MarshalIndent(cleaned, "", "  ")
+		if err != nil {
+			return
+		}
+		tmp := zenEndpointFile() + ".tmp"
+		_ = os.WriteFile(tmp, data, 0600)
+		_ = os.Rename(tmp, zenEndpointFile())
 	}
 }

@@ -346,6 +346,9 @@ func harvestSession(ctx context.Context, key string) (string, error) {
 		// "public" 是"无 key"哨兵，不是真凭据，无法 mint。
 		return "", fmt.Errorf("harvest: no usable key")
 	}
+	if isConsoleKey(key) {
+		return "", fmt.Errorf("harvest: console token does not need session harvesting")
+	}
 	unlock := lockHarvestKey(key)
 	defer unlock()
 	if err := acquireHarvestSlot(ctx); err != nil {
@@ -586,6 +589,11 @@ func mintZenSessions(ctx context.Context, keys []string, force bool, progress fu
 		if k == "" || k == "public" {
 			out[i].Skipped = true
 			out[i].Err = "no usable key"
+			continue
+		}
+		if isConsoleKey(k) {
+			out[i].Skipped = true
+			out[i].Err = "console oauth (no CLI mint needed)"
 			continue
 		}
 		if !force && zenSessionLive(k) {
@@ -905,7 +913,7 @@ func harvestOnForbidden(key string) {
 	if !harvestEnabled() {
 		return
 	}
-	if key == "" || key == "public" {
+	if key == "" || key == "public" || isConsoleKey(key) {
 		return
 	}
 

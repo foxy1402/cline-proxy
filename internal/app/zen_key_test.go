@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -446,5 +447,118 @@ func TestZenKeyTestHonorsExplicitModel(t *testing.T) {
 	}
 	if !strings.Contains(result["reason"].(string), "no-such-model") {
 		t.Fatalf("reason = %v, want it to name the bad model", result["reason"])
+	}
+}
+
+func TestResolveZenKeyIdentity(t *testing.T) {
+	// 普通 Zen API key
+	token, org, isConsole := resolveZenKeyIdentity("sk-plain-123456")
+	if token != "sk-plain-123456" || org != "" || isConsole {
+		t.Fatalf("resolve legacy key failed: token=%s org=%s isConsole=%v", token, org, isConsole)
+	}
+
+	// Console OAuth 令牌 (单 token)
+	token, org, isConsole = resolveZenKeyIdentity("st_user_abc123")
+	if token != "st_user_abc123" || org != "" || !isConsole {
+		t.Fatalf("resolve console key failed: token=%s org=%s isConsole=%v", token, org, isConsole)
+	}
+
+	// Console 多账号带 org 后缀
+	token, org, isConsole = resolveZenKeyIdentity("st_multi_user#org_dept_it")
+	if token != "st_multi_user" || org != "org_dept_it" || !isConsole {
+		t.Fatalf("resolve console multi-account failed: token=%s org=%s isConsole=%v", token, org, isConsole)
+	}
+}
+
+func TestZenKeyTestConsoleTokenHeaders(t *testing.T) {
+	var gotAuth, gotClient, gotOrg, gotSession string
+	setupZenProbeTest(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotClient = r.Header.Get("x-opencode-client")
+		gotOrg = r.Header.Get("x-opencode-org-id")
+		gotSession = r.Header.Get("x-opencode-session")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"}}]}`))
+	})
+
+	consoleKey := "st_test_access_token_123#org_custom_456"
+	result, status := testZenKey(consoleKey, 0, "")
+	if status != "active" {
+		t.Fatalf("testZenKey status = %q (%v), want active", status, result["reason"])
+	}
+
+	if gotAuth != "Bearer st_test_access_token_123" {
+		t.Fatalf("auth header = %q, want 'Bearer st_test_access_token_123'", gotAuth)
+	}
+	if gotClient != "cli" {
+		t.Fatalf("client header = %q, want 'cli'", gotClient)
+	}
+	if gotOrg != "org_custom_456" {
+		t.Fatalf("org header = %q, want 'org_custom_456'", gotOrg)
+	}
+	if !strings.HasPrefix(gotSession, "ses_") || len(gotSession) < 20 {
+		t.Fatalf("session header = %q, want canonical ses_ format", gotSession)
+	}
+}
+
+func TestZenKeyMultiAccountPoolRotation(t *testing.T) {
+	var seenTokens []string
+	setupZenProbeTest(t, func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		seenTokens = append(seenTokens, token)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"}}]}`))
+	})
+
+	savedCfg := getZenConfig()
+	cfg := *savedCfg
+	cfg.Keys = []string{"st_acc1#org_1", "st_acc2#org_2"}
+	setZenConfig(&cfg)
+	defer setZenConfig(savedCfg)
+
+	params := map[string]any{
+		"model":    "aaa-probe-model",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}
+
+	// 连续调用 2 次，应该轮转使用两个不同账号
+	_, _, err1 := callZenAPI(t.Context(), params, false)
+	if err1 != nil {
+		t.Fatalf("callZenAPI 1 failed: %v", err1)
+	}
+	_, _, err2 := callZenAPI(t.Context(), params, false)
+	if err2 != nil {
+		t.Fatalf("callZenAPI 2 failed: %v", err2)
+	}
+
+	if len(seenTokens) != 2 {
+		t.Fatalf("expected 2 calls, got %d", len(seenTokens))
+	}
+	if seenTokens[0] != "st_acc1" || seenTokens[1] != "st_acc2" {
+		t.Fatalf("expected round-robin rotation [st_acc1, st_acc2], got %v", seenTokens)
+	}
+}
+
+func TestCanonicalSessionIDFormat(t *testing.T) {
+	re := regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+	for i := 0; i < 50; i++ {
+		sid := CanonicalSessionID()
+		if !re.MatchString(sid) {
+			t.Fatalf("session ID %q does not match required format", sid)
+		}
+	}
+}
+
+func TestConsoleAuthDiscovery(t *testing.T) {
+	auth, err := GetConsoleAuth()
+	if err != nil {
+		t.Logf("Console auth not available: %v", err)
+		return
+	}
+	if auth.AccessToken == "" {
+		t.Errorf("expected non-empty access token")
+	}
+	if auth.ActiveOrgID == "" {
+		t.Errorf("expected non-empty active org id")
 	}
 }

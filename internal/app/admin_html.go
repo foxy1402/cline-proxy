@@ -558,7 +558,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>Enable opencode upstream</label>
         <select id="ocEnabled"><option value="true">On</option><option value="false">Off</option></select>
       </div>
-      <div class="field" style="flex:2"><label>API keys (one per line, round-robin rotation, auto-cooldown on 429)</label><textarea id="ocKeys" rows="3" placeholder="public"></textarea></div>
+      <div class="field" style="flex:2"><label>API keys / Console OAuth Tokens (one per line, supports <code>token#org_id</code> for multi-accounts)</label><textarea id="ocKeys" rows="3" placeholder="public"></textarea><small id="ocConsoleHint" style="color:var(--text2);display:block;margin-top:4px"></small></div>
     </div>
     <div class="flex" style="gap:10px;margin-bottom:8px;align-items:center;flex-wrap:wrap">
       <label class="hint" style="margin:0">Probe model (used by the Test buttons):</label>
@@ -1321,6 +1321,14 @@ async function loadOcConfig() {
     _('ocFailoverInfo').innerHTML = rt.failoverActive
       ? '<span style="color:var(--danger)">Failover active (opencode unavailable, requests go to the cline pool)</span>'
       : '<span style="color:var(--accent2)">Normal</span>';
+    const hint = _('ocConsoleHint');
+    if (hint) {
+      if (c.consoleAuth && c.consoleAuth.available) {
+        hint.innerHTML = '<span style="color:var(--accent2)">✓ Local OpenCode Console login detected</span> (' + esc(c.consoleAuth.tokenMask) + (c.consoleAuth.orgID ? ' · org: ' + esc(c.consoleAuth.orgID) : '') + '). Active if keys is "public", or enter multiple tokens above (format: <code>token#org_id</code>) to pool accounts.';
+      } else {
+        hint.textContent = 'Supports legacy Zen keys (oc_sk_...) and Console OAuth tokens (st_...#org_id).';
+      }
+    }
   } catch (e) { /* ignore */ }
 }
 

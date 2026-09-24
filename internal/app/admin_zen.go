@@ -14,7 +14,7 @@ import (
 	"cline-go-proxy/internal/kit"
 )
 
-// ============ Zen 免费模型管理 API ============
+// ============ Zen Free Model Management API ============
 
 // GET /admin/api/zen/config
 func handleZenConfig(w http.ResponseWriter, r *http.Request) {
@@ -41,6 +41,13 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 			"failoverActive": zenFailedNow(),
 			"proxyCooldowns": zenProxyCooldownStatus(),
 		},
+	}
+	if auth, err := GetConsoleAuth(); err == nil && auth != nil && auth.AccessToken != "" {
+		data["consoleAuth"] = map[string]any{
+			"available": true,
+			"tokenMask": maskZenKey(auth.AccessToken),
+			"orgID":     auth.ActiveOrgID,
+		}
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: data})
 }
@@ -101,7 +108,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		next.Enabled = *patch.Enabled
 	}
 	if patch.Keys != nil {
-		// 多 key 池整体替换；兼容旧单 key 字段（key 非空时视为单元素列表）
+		// Multi-key pool full replacement; backward compatible with legacy single key
 		if len(patch.Keys) == 0 && (patch.Key == nil || *patch.Key == "") {
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "keys list is empty"})
 			return
@@ -111,7 +118,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if patch.Key != nil && *patch.Key != "" && patch.Keys == nil {
-		// 旧客户端单 key 提交 → 单元素池
+		// Legacy client single key submission -> single element pool
 		next.Keys = []string{*patch.Key}
 	}
 	if patch.BaseURL != nil && *patch.BaseURL != "" {
@@ -165,7 +172,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: getZenConfig()})
 }
 
-// GET /admin/api/opencode/models — 只返回免费模型
+// GET /admin/api/opencode/models — returns only free models
 func handleZenModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -218,7 +225,7 @@ func handleZenStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /admin/api/zen/sessions
-// 每个 key 的 live 会话状态 + 当前（或最后一次）手动 mint 任务的进度。
+// Live session status for each key + progress of current (or last) manual mint task.
 func handleZenSessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -260,12 +267,9 @@ func handleZenSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /admin/api/zen/keys/test   body: {"index": 0}
-// 对单个 zen key 发一个极小探测请求（与 cline 账号的 Test 按钮同语义）。
-// 整个探测固定在该 key 上（zenCallOpts.pinKey），绝不影响正常轮转；成功即
-// 清除该 key 的冷却——真实 2xx 是"该 key 现在可用"的最强证据，比干等上游的
-// Retry-After 更可信。429 原样上报冷却与预计恢复时间（探测本身会让 key 重新
-// 进入冷却，时长来自上游 Retry-After，上限 24h）；403 = 会话已死，探测已顺带
-// 触发收割机，提示去 mint。返回的 status: active / cooldown / error。
+// Sends a lightweight probe request for a single zen key (analogous to Cline account Test button).
+// The probe is pinned to this key (zenCallOpts.pinKey), without affecting regular rotation;
+// a 2xx response clears cooldown on the key.
 func handleZenKeyTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -279,7 +283,7 @@ func handleZenKeyTest(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	var req struct {
 		Index int    `json:"index"`
-		Model string `json:"model"` // 可选：指定探测模型；空 = 自动（big-pickle → live → 种子）
+		Model string `json:"model"` // Optional: specified probe model; empty = auto (big-pickle -> live -> seed)
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
@@ -297,9 +301,7 @@ func handleZenKeyTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, status := testZenKey(key, req.Index, req.Model)
-	// status 必须进 Data：面板的 testZenKey JS 读的是 r.status（与 cline 的
-	// testAccount 相同的契约）。只放在 Message 里的话，每个 toast 都会渲染成
-	// "— undefined" 并套上错误样式。
+	// status must be in Data: the dashboard JS reads r.status
 	result["status"] = status
 	log.Printf("Test zen key #%d (%s): status=%s model=%s reason=%v",
 		req.Index+1, maskZenKey(key), status, result["model"], result["reason"])
@@ -311,12 +313,8 @@ func handleZenKeyTest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// testZenKey 执行单 key 探测："Reply with exactly: OK"，按模型的 Upstream
-// 字段走 chat 或原生 responses 上游（与正常请求同一条路，含 FreeTier gate、
-// 会话粘性与冷却副作用）。modelID 为空时用 zenProbeModel() 自动选择
-// （big-pickle → live 最小 id → 种子兜底）；非空时必须能解析为一个 free
-// zen 模型，否则报错——探测不允许拿付费/不存在的模型当探针。
-// 返回 (结果, 状态)。
+// testZenKey executes a single-key probe: "Reply with exactly: OK", routing to chat
+// or responses based on the model's Upstream field. Returns (result, status).
 func testZenKey(key string, index int, modelID string) (map[string]any, string) {
 	result := map[string]any{
 		"index":   index,
@@ -324,7 +322,7 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 	}
 	var zm *ZenModel
 	if strings.TrimSpace(modelID) != "" {
-		// 支持别名与 opencode/ 前缀（与正常请求的解析规则一致）。
+		// Supports alias and opencode/ prefix matching
 		m, ok := resolveZenFreeModel(modelID)
 		if !ok {
 			result["reason"] = fmt.Sprintf("unknown or non-free zen model: %s", modelID)
@@ -343,8 +341,7 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 	params := map[string]any{
 		"model":    zm.ID,
 		"messages": []any{map[string]any{"role": "user", "content": "Reply with exactly: OK"}},
-		// 上游 2xx 即探测成功；不追求可读内容，但太小会撞上推理模型的
-		// 隐性预算（_finish_reason=length），64 足够容纳一个词。
+		// Upstream 2xx confirms probe success
 		"max_tokens": 64,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -365,9 +362,7 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 
 	he := (*zenHTTPError)(nil)
 	if err != nil && errors.As(err, &he) {
-		// 先看分支再看状态码：isRateLimited 判定的 403/502/503（错误体带限流
-		// 关键词）走的是限流分支——key 刚被冷却、收割机根本没跑，绝不能说
-		// "会话已死/收割机已触发"。只有"干净"的 FreeTier 403 才是会话死亡。
+		// Evaluate rate limit before status code
 		if he.RateLimited {
 			result["httpStatus"] = he.Status
 			result["reason"] = fmt.Sprintf("rate limited (HTTP %d): %s", he.Status, kit.Truncate(he.Body, 300))
@@ -380,7 +375,11 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 		switch he.Status {
 		case http.StatusForbidden:
 			result["httpStatus"] = he.Status
-			result["reason"] = "session rejected (403) — this key's session is no longer live; the harvester was just triggered, use the mint buttons below to retry now"
+			if isConsoleKey(key) {
+				result["reason"] = "console authentication rejected (403) — token expired or invalid; run 'opencode console login' or refresh credentials"
+			} else {
+				result["reason"] = "session rejected (403) — this key's session is no longer live; the harvester was just triggered, use the mint buttons below to retry now"
+			}
 			return result, "error"
 		default:
 			result["httpStatus"] = he.Status
@@ -389,7 +388,7 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 		}
 	}
 	if err != nil {
-		// 网络/超时：不冷却、不改状态（与 cline 的网络错误分支语义一致地保守）
+		// Network/timeout error
 		result["reason"] = "upstream call failed: " + err.Error()
 		return result, "error"
 	}
@@ -402,20 +401,15 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 		return result, "error"
 	}
 
-	// 成功：清除冷却。用量与 403 连败计数**不要**在这里重复复位——上游 200
-	// 路径已经做过（markZenKeySuccess/markZenSuccess/harvestMarkSuccess，
-	// zen.go 两条调用路径各一处）；这里再调一次会把面板的 usage 多加 1。
-	// "成功即复位冷却"本身与 cline 的 Test 按钮同语义。
+	// Success: uncool key
 	uncoolZenKey(key)
 	result["reason"] = "ok"
 	return result, "active"
 }
 
 // POST /admin/api/zen/sessions/mint
-// 手动 mint 全池 live 会话（面板「Force mint/refresh live session ids」）。
-// 后台执行，立即返回——11 个 key 全量重 mint 要几十秒，同步响应会撞反向代理超时。
-// body: {"force": true} —— force=true 连已有 live 会话的 key 也重 mint；
-// 缺省 false 只补未 mint 的 key。任务进行中重复调用返回当前进度（单飞）。
+// Manually mints live sessions for the entire pool. Runs in background.
+// body: {"force": true}
 func handleZenSessionsMint(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})

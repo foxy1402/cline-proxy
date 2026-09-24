@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 )
 
@@ -45,6 +46,7 @@ func TestIsWrongEndpointStatusDiscipline(t *testing.T) {
 		// 瞬时网关错误绝不能被当成模型属性（会持久化到错误端点）
 		{"502 transient", &zenHTTPError{Status: 502, Body: `{"error":"endpoint not found"}`}, false},
 		{"503 overload", &zenHTTPError{Status: 503, Body: `no such model`}, false},
+		{"503 endpoint unavailable", &zenHTTPError{Status: 503, Body: `{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}`}, true},
 		{"504 timeout", &zenHTTPError{Status: 504, Body: `unsupported endpoint`}, false},
 		// 4xx 才看特征词
 		{"404 with routing keyword", &zenHTTPError{Status: 404, Body: `{"error":"model not found"}`}, true},
@@ -84,5 +86,26 @@ func TestZenHTTPErrorText(t *testing.T) {
 	var he *zenHTTPError
 	if !errors.As(fmt.Errorf("wrapped: %w", err), &he) || he.Status != 502 {
 		t.Fatal("wrapped zenHTTPError must be recoverable via errors.As")
+	}
+}
+
+func TestPruneLearnedEndpoints(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("DATA_DIR", tmpDir)
+
+	data := []byte(`{"keep-model": "chat", "prune-model": "responses"}`)
+	if err := os.WriteFile(zenEndpointFile(), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	desired := map[string]bool{"keep-model": true}
+	PruneLearnedEndpoints(desired)
+
+	learned := loadZenEndpointsFile()
+	if learned["keep-model"] != "chat" {
+		t.Errorf("expected keep-model to be preserved, got %q", learned["keep-model"])
+	}
+	if _, ok := learned["prune-model"]; ok {
+		t.Errorf("expected prune-model to be removed")
 	}
 }

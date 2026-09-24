@@ -552,6 +552,23 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 		}
 	}
 
+	clientTools := zenClientTools(params)
+	if isStream && len(clientTools) > 0 {
+		chat, aerr := collectStreamResponse(resp)
+		if aerr != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]string{"message": aerr.Error(), "type": "api_error"},
+			})
+			tracker.finish(false, http.StatusBadGateway)
+			return
+		}
+		chat["model"] = zm.ID
+		repairXMLToolCalls(chat)
+		emitChatAsSSE(w, chat, usageFn)
+		tracker.finish(true, resp.StatusCode)
+		return
+	}
+
 	if isStream {
 		handleStreamResponseWithUsage(w, resp, usageFn)
 		tracker.finish(true, resp.StatusCode)
@@ -583,6 +600,22 @@ func handleZenChatDirect(w http.ResponseWriter, r *http.Request, params map[stri
 		if ct, ok := u["completion_tokens"].(float64); ok {
 			tracker.rec.CompletionTokens = int(ct)
 		}
+	}
+	clientTools := zenClientTools(params)
+	if isStream && len(clientTools) > 0 {
+		chat, aerr := collectStreamResponse(resp)
+		if aerr != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]string{"message": aerr.Error(), "type": "api_error"},
+			})
+			tracker.finish(false, http.StatusBadGateway)
+			return
+		}
+		chat["model"] = zm.ID
+		repairXMLToolCalls(chat)
+		emitChatAsSSE(w, chat, usageFn)
+		tracker.finish(true, resp.StatusCode)
+		return
 	}
 	if isStream {
 		handleStreamResponseWithUsage(w, resp, usageFn)
@@ -722,6 +755,23 @@ func emitChatAsSSE(w http.ResponseWriter, chat map[string]any, usageFn func(map[
 		})
 	}
 	chunk(map[string]any{"role": "assistant"}, nil)
+	if reasoning, ok := msg["reasoning_content"].(string); ok && reasoning != "" {
+		for len(reasoning) > 0 {
+			n := 2048
+			if len(reasoning) < n {
+				n = len(reasoning)
+			} else {
+				for n > 0 && !utf8.RuneStart(reasoning[n]) {
+					n--
+				}
+				if n == 0 {
+					n = 2048
+				}
+			}
+			chunk(map[string]any{"reasoning_content": reasoning[:n]}, nil)
+			reasoning = reasoning[n:]
+		}
+	}
 	content, _ := msg["content"].(string)
 	for len(content) > 0 {
 		n := 2048
@@ -1355,6 +1405,7 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	var (
 		model        string
 		content      strings.Builder
+		reasoning    strings.Builder
 		finishReason string
 		usage        map[string]any
 		// 并行工具调用按上游 index 分桶累积（与 chatStreamToResponses 一致），
@@ -1470,6 +1521,11 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 			if c, ok := delta["content"].(string); ok && c != "" {
 				content.WriteString(c)
 			}
+			if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+				reasoning.WriteString(rc)
+			} else if rc, ok := delta["reasoning"].(string); ok && rc != "" {
+				reasoning.WriteString(rc)
+			}
 			if tcRaw, ok := delta["tool_calls"].([]any); ok {
 				for _, tc := range tcRaw {
 					tcMap, _ := tc.(map[string]any)
@@ -1541,6 +1597,9 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 		"role":    "assistant",
 		"content": content.String(),
 	}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
+	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
 	}
@@ -1569,6 +1628,7 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	if usage != nil {
 		out["usage"] = usage
 	}
+	repairXMLToolCalls(out)
 	return out, nil
 }
 
