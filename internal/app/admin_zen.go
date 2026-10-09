@@ -218,7 +218,7 @@ func handleZenStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /admin/api/zen/sessions
-// 每个 key 的 live 会话状态 + 当前（或最后一次）手动 mint 任务的进度。
+// 每个 key 的 live 会话状态（本地铸造，无收割任务概念）。
 func handleZenSessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -233,28 +233,22 @@ func handleZenSessions(w http.ResponseWriter, r *http.Request) {
 			live++
 		}
 		entry := map[string]any{
-			"index":     i,
-			"keyMask":   maskZenKey(k),
-			"noKey":     k == "" || k == "public",
-			"live":      s.Live,
-			"minted":    s.Minted,
-			"session":   s.Session,
-			"harvested": "",
+			"index":   i,
+			"keyMask": maskZenKey(k),
+			"noKey":   k == "" || k == "public",
+			"live":    s.Live,
+			"session": s.Session,
+			"created": "",
 		}
-		if s.HarvestedAt > 0 {
-			entry["harvested"] = time.Unix(s.HarvestedAt, 0).Format(time.RFC3339)
+		if s.CreatedAt > 0 {
+			entry["created"] = time.Unix(s.CreatedAt, 0).Format(time.RFC3339)
 		}
 		sessions = append(sessions, entry)
 	}
 	data := map[string]any{
-		"harvestEnabled":    harvestEnabled(),
-		"concurrency":       harvestConcurrency(),
-		"intervalHours":     int(harvestInterval() / time.Hour),
-		"keyTimeoutSeconds": int(harvestKeyBudget() / time.Second),
-		"liveCount":         live,
-		"total":             len(keys),
-		"sessions":          sessions,
-		"job":               zenMintJobStatus(),
+		"liveCount": live,
+		"total":     len(keys),
+		"sessions":  sessions,
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: data})
 }
@@ -264,8 +258,8 @@ func handleZenSessions(w http.ResponseWriter, r *http.Request) {
 // 整个探测固定在该 key 上（zenCallOpts.pinKey），绝不影响正常轮转；成功即
 // 清除该 key 的冷却——真实 2xx 是"该 key 现在可用"的最强证据，比干等上游的
 // Retry-After 更可信。429 原样上报冷却与预计恢复时间（探测本身会让 key 重新
-// 进入冷却，时长来自上游 Retry-After，上限 24h）；403 = 会话已死，探测已顺带
-// 触发收割机，提示去 mint。返回的 status: active / cooldown / error。
+// 进入冷却，时长来自上游 Retry-After，上限 24h）；403 = 会话被拒，本地换新
+// 已在后台触发（连续 2 次 403 达阈值）。返回的 status: active / cooldown / error。
 func handleZenKeyTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -366,8 +360,8 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 	he := (*zenHTTPError)(nil)
 	if err != nil && errors.As(err, &he) {
 		// 先看分支再看状态码：isRateLimited 判定的 403/502/503（错误体带限流
-		// 关键词）走的是限流分支——key 刚被冷却、收割机根本没跑，绝不能说
-		// "会话已死/收割机已触发"。只有"干净"的 FreeTier 403 才是会话死亡。
+		// 关键词）走的是限流分支——key 刚被冷却、换新根本没有触发，绝不能说
+		// "会话已死/换新已触发"。只有"干净"的 FreeTier 403 才是会话死亡。
 		if he.RateLimited {
 			result["httpStatus"] = he.Status
 			result["reason"] = fmt.Sprintf("rate limited (HTTP %d): %s", he.Status, kit.Truncate(he.Body, 300))
@@ -380,7 +374,7 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 		switch he.Status {
 		case http.StatusForbidden:
 			result["httpStatus"] = he.Status
-			result["reason"] = "session rejected (403) — this key's session is no longer live; the harvester was just triggered, use the mint buttons below to retry now"
+			result["reason"] = "session rejected (403) — this key's session is no longer live; a freshly minted one will be swapped in automatically after the second consecutive 403"
 			return result, "error"
 		default:
 			result["httpStatus"] = he.Status
@@ -403,49 +397,10 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 	}
 
 	// 成功：清除冷却。用量与 403 连败计数**不要**在这里重复复位——上游 200
-	// 路径已经做过（markZenKeySuccess/markZenSuccess/harvestMarkSuccess，
+	// 路径已经做过（markZenKeySuccess/markZenSuccess/zenSessionMarkSuccess，
 	// zen.go 两条调用路径各一处）；这里再调一次会把面板的 usage 多加 1。
 	// "成功即复位冷却"本身与 cline 的 Test 按钮同语义。
 	uncoolZenKey(key)
 	result["reason"] = "ok"
 	return result, "active"
-}
-
-// POST /admin/api/zen/sessions/mint
-// 手动 mint 全池 live 会话（面板「Force mint/refresh live session ids」）。
-// 后台执行，立即返回——11 个 key 全量重 mint 要几十秒，同步响应会撞反向代理超时。
-// body: {"force": true} —— force=true 连已有 live 会话的 key 也重 mint；
-// 缺省 false 只补未 mint 的 key。任务进行中重复调用返回当前进度（单飞）。
-func handleZenSessionsMint(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
-		return
-	}
-	if !harvestEnabled() {
-		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "harvester unavailable: opencode CLI not present (ZEN_HARVEST_BIN)"})
-		return
-	}
-	var body struct {
-		Force *bool `json:"force"`
-	}
-	if r.Body != nil {
-		raw, err := io.ReadAll(io.LimitReader(r.Body, 4096))
-		if err != nil {
-			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "read body: " + err.Error()})
-			return
-		}
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &body); err != nil {
-				writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON: " + err.Error()})
-				return
-			}
-		}
-	}
-	force := body.Force != nil && *body.Force
-	started, state := startZenMintJob(getZenConfig().Keys, force)
-	msg := "mint job started"
-	if !started {
-		msg = "mint job already running"
-	}
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: msg, Data: state})
 }

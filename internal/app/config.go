@@ -27,13 +27,11 @@ import (
 //	LOG_REQUESTS               请求日志开关，默认 true；"false" 完全关闭（含 body 探测）
 //	LOG_FILE_MAX_MB            requests.jsonl 大写上限 MB，默认 10，超出清空
 //	APPLY_SYSTEM_PROMPT_OVERRIDE  "true" 才启用 override.md 系统提示词替换，默认关闭
+//	STREAM_LOG                 "true" 把 Anthropic 流式原始 SSE 落盘（完整对话，慎用）
+//	STRICT_MODEL_MATCH         "false" 时未知模型静默回退默认模型（默认显式 400）
+//	CLIENT_IP_HEADER           反代部署下取真实客户端 IP 的请求头名（登录限流用）
 //	ZEN_KEYS                   opencode zen 多 key，逗号分隔，配置为空时注入
 //	ZEN_PIN_KEY                zen key 池固定用第 n 个 key（1 起），排障/单 key 直测用
-//	ZEN_HARVEST                zen 会话收割机开关，默认开启；"0" 关闭（纯网关模式）
-//	ZEN_HARVEST_BIN            收割机 CLI 二进制路径，默认 /app/bin/opencode
-//	ZEN_HARVEST_HOME           收割机 CLI 的 HOME（auth.json/sqlite 落点），默认 /app/.opencode-home
-//	ZEN_HARVEST_INTERVAL_HOURS 定时补收割间隔小时数，默认 4，最小 1
-//	  （须小于 zen 的 5h 额度窗口，否则每轮都有一段时间全池会话已过期）
 //	CLINE_ACCOUNTS_SEED_FILE   cline 账号种子文件（[{refreshToken,email}] JSON 数组），
 //	                           池为空时启动自动导入
 //	CLINE_USE_PROXIES          true 时 cline 上游全部走出口代理池（zen 上游配置

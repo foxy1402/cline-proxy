@@ -628,15 +628,13 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <span id="ocSessSummary" class="probe-pill" style="font-weight:normal;margin-left:auto"></span>
   </div>
   <div class="section-body">
-    <p class="hint" style="margin-top:0" id="ocSessHint">The free tier only accepts session IDs the upstream has actually seen, minted by the opencode CLI. A key without a live session <b>always</b> fails with 403 — normally the harvester mints one on startup, on repeated 403s, and every few hours; use the buttons below to mint immediately (e.g. right after a fresh deploy with many keys).</p>
+    <p class="hint" style="margin-top:0" id="ocSessHint">Session IDs are minted locally and match the upstream's format gate (^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$) — no CLI or harvester involved. On repeated FreeTier 403s a key's session is refreshed with a freshly minted one automatically.</p>
     <div class="flex" style="gap:10px;margin-bottom:10px;flex-wrap:wrap">
-      <button class="btn btn-primary" id="ocSessBtnMissing" onclick="mintZenSessions(false)">Mint missing sessions</button>
-      <button class="btn" id="ocSessBtnForce" onclick="mintZenSessions(true)">Force mint / refresh all</button>
       <span class="hint" style="margin:0" id="ocSessTimer"></span>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th style="width:70px">Key</th><th style="width:130px">Session</th><th style="width:150px">State</th><th>Last minted</th></tr></thead>
+        <thead><tr><th style="width:70px">Key</th><th style="width:130px">Session</th><th style="width:150px">State</th><th>Created</th></tr></thead>
         <tbody id="ocSessBody"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
@@ -1362,7 +1360,7 @@ function renderOcKeyStates(ks) {
     ? ks.map(k => {
         const st = k.sessionLive
           ? '<span style="color:var(--accent2)">live</span>'
-          : (k.sessionMinted ? '<span style="color:var(--danger)">stale</span>' : '<span style="color:var(--danger)">not minted</span>');
+          : '<span style="color:var(--danger)">no session</span>';
         const cool = k.cooling
           ? '<span style="color:var(--danger)">cooling' + (k.cooldownUntil ? ' · until ' + esc(fmtWhen(k.cooldownUntil)) : '') + '</span>'
           : '<span style="color:var(--text2)">-</span>';
@@ -1469,7 +1467,8 @@ async function loadOcModels() {
 }
 
 // ========== Live session IDs (zen FreeTier gate) ==========
-// 未 mint 的 key 必 403；表格让"哪些 key 还是空会话"一眼可见，按钮给手动补收口。
+// 会话由本地铸造、格式即凭证；表格让每个 key 的会话状态一眼可见。
+// mint 任务已随收割机移除；可见标签页轮询照常刷新会话表。
 let ocSessPoll = null;
 
 async function loadOcSessions() {
@@ -1486,93 +1485,21 @@ function renderOcSessions(s) {
     ? '<span style="color:' + (s.liveCount === s.total ? 'var(--accent2)' : 'var(--danger)') + '">' +
       s.liveCount + '/' + s.total + ' live</span>'
     : '';
-  // 刷新节奏与并发写进提示行：用户据此判断"自动维护是否够用"，以及
-  // 调 ZEN_HARVEST_INTERVAL_HOURS / ZEN_HARVEST_CONCURRENCY 要不要改。
-  const h = _('ocSessHint');
-  if (h) {
-    const base = 'The free tier only accepts session IDs the upstream has actually seen, minted by the opencode CLI. A key without a live session <b>always</b> fails with 403.';
-    h.innerHTML = base + (s.harvestEnabled
-      ? ' Auto-refresh every <b>' + (s.intervalHours || 4) + 'h</b> (kept below the 5h quota window), minting <b>' +
-        (s.concurrency || 1) + '</b> key(s) at a time' +
-        ((s.concurrency || 1) === 1 ? ' (one after another — safest on small instances, the CLI is CPU/RAM hungry)' : '') + '.'
-      : ' <b>Harvester unavailable</b> — no opencode CLI in this container (ZEN_HARVEST_BIN).');
-  }
-  // CLI 不在时后端会以 400 拒绝 mint，按钮先禁用，避免点了才发现。
-  const usable = !!s.harvestEnabled;
-  ['ocSessBtnMissing', 'ocSessBtnForce'].forEach(id => {
-    const b = _(id);
-    if (b) { b.disabled = !usable; b.title = usable ? '' : 'opencode CLI not available in this container'; }
-  });
   _('ocSessBody').innerHTML = rows.length
     ? rows.map(k => {
         const state = k.noKey
           ? '<span style="color:var(--text2)">no key</span>'
           : (k.live
               ? '<span style="color:var(--accent2)">live</span>'
-              : (k.minted ? '<span style="color:var(--danger)">stale</span>' : '<span style="color:var(--danger)">not minted</span>'));
+              : '<span style="color:var(--danger)">no session</span>');
         return '<tr><td>#' + (k.index + 1) + '</td>' +
           '<td style="font-family:monospace;font-size:11px">' + (k.session ? esc(k.session) + '…' : '-') + '</td>' +
           '<td>' + state + '</td>' +
-          '<td style="font-size:12px">' + (k.harvested ? esc(fmtWhen(k.harvested)) : '-') + '</td></tr>';
+          '<td style="font-size:12px">' + (k.created ? esc(fmtWhen(k.created)) : '-') + '</td></tr>';
       }).join('')
     : '<tr><td colspan="4" class="empty">No zen keys configured</td></tr>';
-
-  const j = s.job;
-  if (!j) { _('ocSessTimer').textContent = ''; return; }
-  if (j.running) {
-    _('ocSessTimer').innerHTML = '<span style="color:var(--accent)">minting ' + (j.done || 0) + '/' + (j.total || 0) + '…</span>';
-    renderOcMintResults(j.results || [], true);
-  } else {
-    _('ocSessTimer').textContent = 'last mint ' + fmtWhen(j.startedAt) + (j.force ? ' (force)' : '');
-    renderOcMintResults(j.results || [], false);
-  }
-}
-
-function renderOcMintResults(results, running) {
-  if (!results.length) { _('ocSessResult').innerHTML = ''; return; }
-  const ok = results.filter(r => r.ok).length;
-  const skipped = results.filter(r => r.skipped).length;
-  const fail = results.filter(r => r.done && !r.ok && !r.skipped).length;
-  const pending = results.filter(r => !r.done).length;
-  const head = running
-    ? '<span style="color:var(--accent)">Running — ' + ok + ' minted, ' + fail + ' failed, ' + pending + ' pending</span>'
-    : (fail
-        ? '<span style="color:var(--danger)">Done — ' + ok + ' minted, ' + fail + ' failed' + (skipped ? ', ' + skipped + ' skipped (already live)' : '') + '</span>'
-        : '<span style="color:var(--accent2)">Done — ' + ok + ' minted' + (skipped ? ', ' + skipped + ' already live' : '') + '</span>');
-  const details = results.filter(r => r.done && !r.ok && !r.skipped)
-    .map(r => '#' + (r.index + 1) + ': ' + esc(r.error || 'failed')).join(' | ');
-  _('ocSessResult').innerHTML = '<div style="font-size:12px">' + head + '</div>' +
-    (details ? '<div class="hint" style="margin-top:4px">' + details + '</div>' : '');
-}
-
-async function mintZenSessions(force) {
-  try {
-    await api('POST', '/opencode/sessions/mint', { force: force });
-    toast(force ? 'Force minting all sessions…' : 'Minting missing sessions…', 'success');
-    // 任务在后端跑（串行 mint 时一批是 key 数 × 每 key 预算），按 2s 轮询进度。
-    // 上限按后端批次预算推算：并发默认为 1 后 11 个 key 的批次上限可达几十分钟，
-    // 写死 450 次（15 分钟）会让轮询提前停掉、进度条卡住不再更新。
-    if (ocSessPoll) { clearInterval(ocSessPoll); ocSessPoll = null; }
-    let ticks = 0;
-    const s0 = await loadOcSessions();
-    // 提前返回前必须把 ocSessPoll 置空：可见标签页的 20s 轮询用 !ocSessPoll
-    // 判断"是否已有轮询在跑"，留一个已 clear 的非空句柄会让它永久停摆。
-    if (!s0 || !s0.job || !s0.job.running) { ocSessPoll = null; return; }
-    const j0 = s0.job;
-    const workers = Math.max(1, s0.concurrency || 1);
-    const perKey = s0.keyTimeoutSeconds || 150;
-    // 下限 15 分钟与后端 harvestBatchTimeout 的下限对齐：key 少时后端照样跑满
-    // 15 分钟，而 ceil(total/workers)×perKey 只有几分钟，不夹下限轮询会在后端
-    // 放弃之前就停掉（之后只剩 20s 的可见标签页轮询，进度更新变粗）。
-    const batchSeconds = Math.max(900, Math.ceil((j0.total || 1) / workers) * perKey + 120);
-    const maxTicks = Math.min(1800, Math.ceil(batchSeconds / 2) + 30);
-    ocSessPoll = setInterval(async () => {
-      const s = await loadOcSessions();
-      if (!s || !s.job || !s.job.running || ++ticks >= maxTicks) {
-        clearInterval(ocSessPoll); ocSessPoll = null; loadOcConfig();
-      }
-    }, 2000);
-  } catch (e) { toast('Mint failed: ' + e.message, 'error'); }
+  _('ocSessTimer').textContent = '';
+  _('ocSessResult').innerHTML = '';
 }
 
 // ========== Combos (alias models) ==========
@@ -1675,7 +1602,6 @@ loadConfig();
 setInterval(() => { loadStats(); }, 10000);
 setInterval(() => { loadOcStats(); }, 15000);
 // live 会话状态：只在 opencode 页可见时轮询（与日志页同样的省流约定）。
-// mint 任务进行中由 mintZenSessions 自己的 2s 轮询接管。
 setInterval(() => {
   if (_('tab-opencode').style.display !== 'none' && !ocSessPoll) loadOcSessions();
 }, 20000);

@@ -22,10 +22,7 @@ services:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
       # opencode zen keys, comma-separated (optional; can also be set in the admin panel)
       - ZEN_KEYS=${ZEN_KEYS:-}
-      # Zen session harvester (see docs/zen-harvester.md): ZEN_HARVEST=0 disables
-      # it; ZEN_HARVEST_INTERVAL_HOURS tunes the periodic re-mint interval.
-      - ZEN_HARVEST=${ZEN_HARVEST:-}
-      - ZEN_HARVEST_INTERVAL_HOURS=${ZEN_HARVEST_INTERVAL_HOURS:-}
+      # Zen session IDs are minted locally (no harvester, no CLI, no extra env).
       # Account pool strategy, default round_robin (fill / random)
       - POOL_STRATEGY=${POOL_STRATEGY:-round_robin}
       # Request-log switch, default on (metadata only, 10MB cap auto-wipe)

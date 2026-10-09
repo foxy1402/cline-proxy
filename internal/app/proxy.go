@@ -81,7 +81,6 @@ func StartProxy(host string, port int) error {
 	startPoolFlusher()
 	loadZenEndpoints()
 	loadClineStreamLearned()
-	startZenHarvester()
 	initStats()
 	LoadRequestLogsFromFile()
 	go cleanupCompactStates()
@@ -148,7 +147,8 @@ func StartProxy(host string, port int) error {
 			valid := false
 			for _, k := range keys {
 				if subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
-							break
+					valid = true
+					break
 				}
 			}
 
@@ -377,7 +377,11 @@ func StartProxy(host string, port int) error {
 	fmt.Println(strings.Repeat("=", 58))
 	fmt.Printf("  http://%s\n", addr)
 	fmt.Printf("  http://%s/v1\n", addr)
-	fmt.Println("  API Key: any value")
+	if APIKeyEnv() != "" {
+		fmt.Println("  API Key: (set via API_KEY env)")
+	} else {
+		fmt.Println("  API Key: any value")
+	}
 	fmt.Printf("  Model:   %s (auto-detected)\n", getDefaultModel())
 	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)
 	fmt.Println(strings.Repeat("=", 58))

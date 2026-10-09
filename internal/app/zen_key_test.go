@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,29 +15,27 @@ import (
 //   - 整个探测固定在被探测的 key 上（绝不中途换 key、绝不影响正常轮转）；
 //   - 2xx  → active，且清除该 key 的冷却；
 //   - 429  → cooldown，回报上游 Retry-After 决定的预计恢复时间；
-//   - 403  → error（会话已死），收割机被顺带触发。
+//   - 403  → error（会话已死），本地会话换新被顺带触发。
 //
 // 上游用 httptest 假服务（与 zen_learn_confirm_test.go 同一模式）。
 
 func setupZenProbeTest(t *testing.T, handler http.HandlerFunc) {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("DATA_DIR", dir)
-	// 默认 ZEN_HARVEST_BIN (/app/bin/opencode) 在测试机上不存在，harvestEnabled()
-	// 为 false 会让 harvestOnForbidden 在计数前就返回；指向测试二进制自身
-	// （只做 os.Stat 存在性检查，503 计数路径不会真执行它）。
-	if exe, err := os.Executable(); err == nil {
-		t.Setenv("ZEN_HARVEST_BIN", exe)
-	}
-	// 清掉其他测试留下的冷却/连败状态：这些是包级 map，串行测试间会渗漏
+	t.Setenv("DATA_DIR", t.TempDir())
+	// 清掉其他测试留下的冷却/403 计数状态：这些是包级 map，串行测试间会渗漏
 	//（sk-pin333 的 60s 冷却曾渗进后续用例）。
 	zenKeyMu.Lock()
 	zenKeyCool = map[string]time.Time{}
 	zenKeyMu.Unlock()
-	harvestMu.Lock()
-	harvestFails = map[string]int{}
-	harvestLastTry = map[string]time.Time{}
-	harvestMu.Unlock()
+	zenRecoverMu.Lock()
+	zenRecoverFails = map[string]int{}
+	zenRecoverLastAt = map[string]int64{}
+	zenRecoverMu.Unlock()
+	zenSessMu.Lock()
+	zenSessions = map[string]*zenSessionEntry{}
+	zenSessLoaded = true
+	zenSessPath = ""
+	zenSessMu.Unlock()
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
@@ -131,7 +128,7 @@ func TestZenKeyTestProbe429ReportsCooldown(t *testing.T) {
 	}
 }
 
-func TestZenKeyTestProbe403ReportsSessionDeadAndTriggersHarvest(t *testing.T) {
+func TestZenKeyTestProbe403ReportsSessionDeadAndTriggersRefresh(t *testing.T) {
 	setupZenProbeTest(t, func(w http.ResponseWriter, r *http.Request) {
 		// 纯 FreeTier 403：body 不得含限流关键词（否则 isRateLimited 会把它
 		// 当 429 分支处理，测不到会话死亡路径）
@@ -146,24 +143,24 @@ func TestZenKeyTestProbe403ReportsSessionDeadAndTriggersHarvest(t *testing.T) {
 	if got := result["httpStatus"]; got != http.StatusForbidden {
 		t.Fatalf("httpStatus = %v, want 403", got)
 	}
-	// harvestOnForbidden 是异步触发的（go ...），给它一点时间落账
+	// refreshZenSession 是异步触发的（go ...），给它一点时间落账
 	deadline := time.Now().Add(2 * time.Second)
 	fails := 0
 	for {
-		harvestMu.Lock()
-		fails = harvestFails[key]
-		harvestMu.Unlock()
+		zenRecoverMu.Lock()
+		fails = zenRecoverFails[key]
+		zenRecoverMu.Unlock()
 		if fails == 1 || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if fails != 1 {
-		t.Fatalf("harvest fail counter = %d, want 1 (probe must trigger the harvester)", fails)
+		t.Fatalf("403 fail counter = %d, want 1 (probe must trigger the local session refresh)", fails)
 	}
-	harvestMu.Lock()
-	delete(harvestFails, key)
-	harvestMu.Unlock()
+	zenRecoverMu.Lock()
+	delete(zenRecoverFails, key)
+	zenRecoverMu.Unlock()
 }
 
 // pin 语义：429 时绝不换 key、绝不重试——一次探测恰好一次上游调用，且始终是
@@ -254,7 +251,7 @@ func TestZenKeyTestHandlerPutsStatusInData(t *testing.T) {
 }
 
 // P2：限流型 403（错误体带限流关键词 → isRateLimited 命中）必须按"冷却"回报，
-// 绝不能说"会话已死/收割机已触发"——那个分支根本没有触发收割机。
+// 绝不能说"会话已死/换新已触发"——那个分支根本没有触发换新。
 func TestZenKeyTestRateLimitShaped403ReportsCooldown(t *testing.T) {
 	setupZenProbeTest(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -268,11 +265,11 @@ func TestZenKeyTestRateLimitShaped403ReportsCooldown(t *testing.T) {
 	if !zenKeyCooling(key) {
 		t.Fatal("keyword-403 probe did not cool the key")
 	}
-	harvestMu.Lock()
-	fails := harvestFails[key]
-	harvestMu.Unlock()
+	zenRecoverMu.Lock()
+	fails := zenRecoverFails[key]
+	zenRecoverMu.Unlock()
 	if fails != 0 {
-		t.Fatalf("harvest fail counter = %d, want 0 (rate-limited 403 must not trigger the harvester)", fails)
+		t.Fatalf("403 fail counter = %d, want 0 (rate-limited 403 must not trigger a session refresh)", fails)
 	}
 	if result["cooldownUntil"] == nil || result["remaining"] == nil {
 		t.Fatalf("cooldown fields missing: %v", result)

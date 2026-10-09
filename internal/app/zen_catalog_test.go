@@ -12,9 +12,7 @@ func TestZenDesiredFromLiveRegistryWins(t *testing.T) {
 		"mimo-v2.5-free":                  true,
 		"muse-spark-1.3-contributor-free": true,
 	}
-	// CLI 列表里还有个已 unlisted 的免费模型 + 一个付费模型
-	cli := []string{"opencode/big-pickle", "opencode/mimo-v2.5-free", "opencode/ghost-free", "opencode/gpt-5.5"}
-	got, err := zenDesiredFromLive(true, free, cli)
+	got, err := zenDesiredFromLive(true, free)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -26,55 +24,23 @@ func TestZenDesiredFromLiveRegistryWins(t *testing.T) {
 			t.Errorf("registry-free model %q missing from desired", id)
 		}
 	}
-	if got["ghost-free"] {
-		t.Error("CLI-only id must not be added when the registry is reachable (registry is the authority)")
-	}
-	if got["gpt-5.5"] {
-		t.Error("paid model leaked into the free catalog")
+	if len(got) != 3 {
+		t.Fatalf("desired = %v, want exactly 3 entries", got)
 	}
 }
 
-// 目录不可达：用 opencode models 成员表 + "-free"/big-pickle 启发式（fail-open）。
-func TestZenDesiredFromLiveCLIFallback(t *testing.T) {
-	cli := []string{
-		"opencode/big-pickle",     // 无后缀但已知免费别名
-		"opencode/mimo-v2.5-free", // 后缀命中
-		"opencode/gpt-5.5",        // 付费：必须排除
-		"",                        // 空行
+// 目录不可达：报错（调用方保留旧表，种子条目在首次成功同步前仍可服务）。
+// 收割机时代的 CLI 成员表兜底已随内嵌 CLI 移除。
+func TestZenDesiredFromLiveRegistryDownErrors(t *testing.T) {
+	got, err := zenDesiredFromLive(false, nil)
+	if err == nil {
+		t.Fatal("expected error when registry is unreachable")
 	}
-	got, err := zenDesiredFromLive(false, nil, cli)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if got != nil {
+		t.Fatalf("desired = %v, want nil on error", got)
 	}
-	if !got["big-pickle"] || !got["mimo-v2.5-free"] {
-		t.Fatalf("desired = %v, want big-pickle + mimo-v2.5-free", got)
-	}
-	if got["gpt-5.5"] {
-		t.Error("paid id must not pass the fallback filter")
-	}
-	if len(got) != 2 {
-		t.Fatalf("desired = %v, want exactly 2 entries", got)
-	}
-}
-
-// 两个来源都不可用：报错（调用方保留旧表），绝不能把空集当成"没有免费模型"。
-func TestZenDesiredFromLiveNoSources(t *testing.T) {
-	if _, err := zenDesiredFromLive(false, nil, nil); err == nil {
-		t.Fatal("expected error when registry is down and CLI gave nothing")
-	}
-	if _, err := zenDesiredFromLive(true, map[string]bool{}, nil); err == nil {
-		t.Fatal("expected error when registry returned no free models and CLI gave nothing")
-	}
-}
-
-// 目录可达但免费集合为空（接口异常）时，应退回 CLI 而不是清空目录。
-func TestZenDesiredFromLiveEmptyRegistryFallsBackToCLI(t *testing.T) {
-	got, err := zenDesiredFromLive(true, map[string]bool{}, []string{"opencode/ling-3.0-flash-fin-free"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !got["ling-3.0-flash-fin-free"] {
-		t.Fatalf("desired = %v, want the CLI free entry", got)
+	if _, err := zenDesiredFromLive(true, map[string]bool{}); err == nil {
+		t.Fatal("expected error when registry returned no free models")
 	}
 }
 

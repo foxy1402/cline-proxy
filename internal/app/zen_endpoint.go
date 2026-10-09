@@ -41,7 +41,7 @@ func zenEndpointFile() string {
 
 // zenHTTPError zen 上游返回的非 2xx 答复（携带状态码）。
 // 端点学习必须只依据"上游真的按 HTTP 拒绝了"，而不是错误文本——网络层错误
-//（DNS 解析失败、拨号超时）的错误串里天然含 "no such host" 之类的词，靠子串
+// （DNS 解析失败、拨号超时）的错误串里天然含 "no such host" 之类的词，靠子串
 // 匹配会把一次瞬时断网永久固化成"该模型该走 responses"，且写进持久化文件后
 // 目录同步不会自愈。类型化错误让判定只看状态码。
 type zenHTTPError struct {
@@ -56,6 +56,51 @@ type zenHTTPError struct {
 
 func (e *zenHTTPError) Error() string {
 	return fmt.Sprintf("zen API %d: %s", e.Status, e.Body)
+}
+
+// zenDeprecationFromError 从上游非 2xx 答复里识别弃用信号：
+//   - 410 + body 带 "replacement":"<id>"（实测 mimo-v2.5-free 形态）→ 标记别名
+//     并返回继任 ID；
+//   - 400 + "model is unavailable" / "modeldeprecated"（实测 qwen3.6-plus-free
+//     形态）→ 标记死亡到下次目录同步，返回 ""；
+//   - 其余 → ""。
+//
+// 只有这两个 status 会触发判定：其他状态码即使错误体带 "replacement" 字样
+// （部分通用错误的 suggestion 类字段）也绝不误判。
+func zenDeprecationFromError(status int, body string) (replacement string) {
+	low := strings.ToLower(body)
+	switch status {
+	case http.StatusGone:
+		if repl := zenExtractReplacement(body); repl != "" {
+			return repl
+		}
+	case http.StatusBadRequest:
+		if strings.Contains(low, "model is unavailable") || strings.Contains(low, "modeldeprecated") {
+			// 死亡标记由调用方带上模型 ID 完成（这里没有模型上下文）。
+			return ""
+		}
+	}
+	return ""
+}
+
+// zenExtractReplacement 从 410 响应体提取 "replacement":"<id>"（宽松 JSON 提取，
+// 不依赖完整反序列化成功）。
+func zenExtractReplacement(body string) string {
+	var probe struct {
+		Replacement string `json:"replacement"`
+		Error       struct {
+			Replacement string `json:"replacement"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &probe) == nil {
+		if probe.Replacement != "" {
+			return probe.Replacement
+		}
+		if probe.Error.Replacement != "" {
+			return probe.Error.Replacement
+		}
+	}
+	return ""
 }
 
 // isWrongEndpoint 上游错误是否呈"走错端点"特征。
@@ -125,6 +170,8 @@ func isWrongEndpointResponses(err error) bool {
 
 // learnZenEndpoint 学习并持久化某模型的原生端点（"responses" 或 ""）。
 // 与 applyZenCatalog 同样用副本替换：池内条目一旦发布就不再改写。
+// 注意 chat 决策（""）必须落盘：Upstream=="" 同时是 npm 播种的默认态，
+// 不落盘的话每次目录同步都会按 npm 把它重新播回 responses（flapping）。
 func learnZenEndpoint(modelID, upstream string) {
 	initZenModels()
 	zenModelsMu.Lock()
@@ -132,6 +179,9 @@ func learnZenEndpoint(modelID, upstream string) {
 	if ok && m != nil && m.Upstream != upstream {
 		next := *m
 		next.Upstream = upstream
+		// Source=learned：显式标记"学习器已定论"，applyZenCatalog 据此永不
+		// 重播种（live 同步会把 Source 抹成 live，因此标记保存在学习文件里）。
+		next.Source = "learned"
 		zenModels[modelID] = &next
 		log.Printf("zen endpoint learned: model=%s upstream=%q (persisted)", modelID, upstream)
 	}
@@ -154,6 +204,8 @@ func loadZenEndpointsFile() map[string]string {
 }
 
 // applyZenEndpoints 把学习结果敷用到模型表上（调用方不持锁）。返回生效条数。
+// 学习文件里 "chat" 表示学习器定论为 chat/completions（Upstream=""）——
+// 与"无记录"不同：记录过的 ID 目录 npm 不得再重播种。
 func applyZenEndpoints(learned map[string]string) int {
 	if len(learned) == 0 {
 		return 0
@@ -163,6 +215,9 @@ func applyZenEndpoints(learned map[string]string) int {
 	defer zenModelsMu.Unlock()
 	n := 0
 	for id, up := range learned {
+		if up == zenLearnedChat {
+			up = ""
+		}
 		if up != "responses" && up != "" {
 			continue
 		}
@@ -172,6 +227,7 @@ func applyZenEndpoints(learned map[string]string) int {
 		}
 		next := *m
 		next.Upstream = up
+		next.Source = "learned"
 		zenModels[id] = &next
 		n++
 	}
@@ -189,7 +245,7 @@ func loadZenEndpoints() {
 // reapplyLearnedEndpoints 目录同步后重新敷用学习结果。
 //
 // 启动时 loadZenEndpoints 只覆盖当时已存在的条目：模型目录是首次同步才填进来的
-//（启动顺序上刷新协程与 loadZenEndpoints 并行），同步新增/重建的条目不在视野里。
+// （启动顺序上刷新协程与 loadZenEndpoints 并行），同步新增/重建的条目不在视野里。
 // 不同步后补敷用，这些模型每次重启都要重新探测一遍端点。
 func reapplyLearnedEndpoints() {
 	learned := loadZenEndpointsFile()
@@ -198,12 +254,18 @@ func reapplyLearnedEndpoints() {
 	}
 }
 
-// saveZenEndpoints 持久化当前 Upstream 非空的学习结果。
+// saveZenEndpoints 持久化学习结果。
 //
 // 串行化：learnZenEndpoint 由并发请求路径调用，且它在释放 zenModelsMu 之后才走到
 // 这里。两个 goroutine 同时写同一个 .tmp 再 rename，后一次 rename 会对已不存在的
 // tmp 报错，读到半个文件的 loadZenEndpoints 还会把整个学习表当损坏丢掉。
+//
+// 两种决策都落盘：responses 与 learned-chat（"" 存为 "chat"，避免与
+// "无记录=默认 chat" 混淆）。applyZenCatalog 对文件里出现过的 ID 不再重播种。
 var zenEndpointSaveMu sync.Mutex
+
+// zenLearnedChat 学习文件中 chat 决策的存盘写法（空串在 map 里与"缺失"无法区分）。
+const zenLearnedChat = "chat"
 
 func saveZenEndpoints() {
 	zenEndpointSaveMu.Lock()
@@ -212,8 +274,13 @@ func saveZenEndpoints() {
 	zenModelsMu.RLock()
 	learned := map[string]string{}
 	for id, m := range zenModels {
-		if m != nil && m.Upstream == "responses" && m.Source != "seed" {
-			learned[id] = m.Upstream
+		if m == nil || m.Source != "learned" {
+			continue
+		}
+		if m.Upstream == "responses" {
+			learned[id] = "responses"
+		} else if m.Upstream == "" {
+			learned[id] = zenLearnedChat
 		}
 	}
 	zenModelsMu.RUnlock()

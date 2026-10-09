@@ -13,6 +13,41 @@ The admin panel is setup/maintenance only, not part of daily operation.
 Release blockers before ANY public exposure: **M1 (env config + /v1 API key)**
 and **M2 (admin auth)**. Everything else can land incrementally.
 
+## Zen sessions minted locally; harvester deleted (2026-10-08)
+
+Live probes (2026-10-09, through this repo's exact direct stack — Bun TLS
+fingerprint + CLI headers) proved zen's free-tier session gate is a **stateless
+format check**: any ID matching `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$` passes
+(200 ×3 incl. reuse); the old `sess_`+26 placeholder 403'd purely on format.
+The harvester's premise ("only CLI-minted sessions pass") was confounded by
+that malformed placeholder. Consequences, all landed:
+
+- **`kit.MintZenSessionID`** ports opencode's descending `SessionID.create()`
+  (inverted `ts_ms<<12|counter` → 12 hex + 14 crypto/rand base62 chars);
+  `kit.ValidZenSessionID` encodes the gate regex. Sticky sessions
+  (`zen_session.go`) mint locally; no embedded CLI, no per-key HOME dance.
+- **Migration on load**: legacy `sess_*` placeholders are replaced with freshly
+  minted IDs (they 403'd forever); legacy `ses_*` entries kept as-is;
+  `harvestedAt` renamed to `createdAt` on write.
+- **403 recovery is local** (`refreshZenSession`): 2 consecutive FreeTier 403s
+  per key → fresh minted session, 1-minute per-key backoff (the old 10-minute
+  cooldown existed only because CLI mints were expensive). If zen ever tightens
+  the gate, the refresh rate in the logs is the tripwire.
+- **Harvester deleted**: `zen_harvest.go`, its tests, the admin mint buttons /
+  `/sessions/mint` endpoints, all six `ZEN_HARVEST*` env vars, the Dockerfile
+  CLI stage (~185MB off the image; QEMU no longer used at build time) and
+  `docs/zen-harvester.md`. The registry-unreachable model-sync fallback through
+  `opencode models` is gone too — offline startup serves the seed list only.
+- **Deterministic route seeding**: the catalog's per-model `provider.npm` now
+  seeds `Upstream` (`@ai-sdk/openai` → native `/responses`,
+  `@ai-sdk/openai-compatible` → chat/completions), replacing the muse-spark
+  name heuristic; the endpoint learner stays as the correction layer for drift.
+- **Deprecated-model handling**: upstream `410` with a `replacement` hint
+  transparently remaps to the successor (persisted in
+  `.zen-model-aliases.json`, one retry per request); `400` "Model is
+  unavailable" marks the model dead until the next catalog sync.
+
+
 ## Current state (audit 2026-09-15)
 
 - Admin panel (`/admin/`, all `/admin/api/*`) has **no authentication at all**;
