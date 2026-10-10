@@ -1,5 +1,36 @@
 # TODO — Public container deployment: stateless /v1 proxy with multi-account rotation
 
+## Zen session rotation was lazy-only; fixed with a background rotator (2026-10-10)
+
+Reported bug: zen sessions did not rotate after the interval unless you clicked
+Test; Test rotated one key but the rest never did. Root cause was deeper than
+rotation — **round-robin had collapsed onto the first key**:
+
+- `pickZenKey`'s first pass only selects keys that already have a valid session
+  (`live[k]`), but a session is minted lazily inside `StickyZenIdentity`, i.e.
+  *after* the key is chosen. The two conditions were mutually dependent: key#1
+  got picked → got a session → kept satisfying the first pass; keys #2/#3 were
+  never picked → never minted → permanently skipped. The old CLI harvester used
+  to keep every key live in the background; deleting it removed that invariant,
+  so the second effect (idle keys never rotate) was really the first effect
+  (idle keys never used) in disguise.
+- Fix: `startZenSessionRotator` — a 1-minute background pass (same shape as
+  `startZenModelsRefresher`) that walks every configured key and (a) mints a
+  session if missing/invalid, (b) re-mints it if older than
+  `SessionRotateMinutes`. It touches no upstream and consumes no quota (the ID
+  is local). `SessionRotateMinutes=0` still disables age rotation but keeps the
+  pre-mint, so an idle key can never be starved out of round-robin again.
+- The request path keeps its lazy check as a fallback for when the rotator is
+  not running (a test binary, or a build that never calls `StartProxy`).
+- `mintZenSessionEntryLocked` now centralizes minting so the request path, the
+  rotator, and `refreshZenSession` cannot drift apart.
+- Tests: idle keys minted; aged idle keys rotated; disabled still mints but does
+  not rotate; public sentinel skipped; and `TestRotatorRestoresKeyRotation`
+  proves pickZenKey round-robins across all keys once the rotator has run.
+- Verified live on the built image with `ZEN_SESSION_ROTATE_MINUTES=1`: before
+  the fix all 7 requests went to key#1 and only key#1 got a session; after the
+  fix the initial pass mints all 3 and each rotates on schedule.
+
 ## Zen session rotation + dashboard consolidation (2026-10-10)
 
 - **Session rotation**: a zen key's sticky session is re-minted once older than

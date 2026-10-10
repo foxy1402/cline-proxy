@@ -245,13 +245,25 @@ func sessionRotateInterval() time.Duration {
 	return time.Duration(n) * time.Minute
 }
 
+// mintZenSessionEntryLocked 就地刷新条目的会话：新 ID + 新创建时间 + 合法标记，
+// 并在 UA 缺失时补上客户端指纹。调用方须持有 zenSessMu。
+// 请求路径与后台巡检共用，避免两处铸造逻辑漂移。
+func mintZenSessionEntryLocked(e *zenSessionEntry, now time.Time) {
+	e.Session = kit.MintZenSessionID()
+	e.CreatedAt = now.Unix()
+	e.Minted = true
+	if e.UA == "" {
+		e.UA = zenNativeUA
+	}
+}
+
 // StickyZenIdentity 取 key 绑定的稳定身份：会话 ID 与 UA 跨请求复用，
 // 请求 ID 每次全新（与官方 CLI 语义一致：同会话内多 msg_）。
 // 返回 (session, request, user-agent)。
 //
-// 会话老化轮换：条目年龄超过 SessionRotateMinutes 时在请求路径上重铸（同步、
-// 零成本）——上游对久未更新的会话首个请求会明显变慢，定期换新可把它挡在用户
-// 感知之前。轮换只在真正用到该 key 时发生，不额外起后台任务。
+// 会话老化轮换：条目年龄超过 SessionRotateMinutes 时重铸（同步、零成本）。
+// 主路径是后台巡检（startZenSessionRotator）——它保证空闲 key 也会按周期换新，
+// 这里的同款判断只是兜底：巡检未运行（未启用/未启动）时请求仍能自愈。
 func StickyZenIdentity(key string) (sess, req, ua string) {
 	loadZenSessions()
 	// 轮换周期先读（会取 zenConfigMu），再进 zenSessMu：与 zenKeyStatus 同约定，
@@ -261,21 +273,18 @@ func StickyZenIdentity(key string) (sess, req, ua string) {
 	defer zenSessMu.Unlock()
 	now := time.Now()
 	e, ok := zenSessions[key]
-	if !ok || e.Session == "" {
-		e = &zenSessionEntry{
-			Session:   kit.MintZenSessionID(),
-			UA:        zenNativeUA,
-			CreatedAt: now.Unix(),
+	if !ok || !kit.ValidZenSessionID(e.Session) {
+		if e == nil {
+			e = &zenSessionEntry{}
+			zenSessions[key] = e
 		}
-		zenSessions[key] = e
+		mintZenSessionEntryLocked(e, now)
 		saveZenSessionsLocked()
 		log.Printf("zen sticky session minted locally for key#%d: %s", keyIndex(key), kit.Truncate(e.Session, 24))
 	} else if iv > 0 && e.CreatedAt > 0 && now.Sub(time.Unix(e.CreatedAt, 0)) >= iv {
 		// 老化轮换：重铸会话（保留 UA），并清掉 403 失败印记——新会话是干净状态。
 		age := now.Sub(time.Unix(e.CreatedAt, 0)).Round(time.Minute)
-		e.Session = kit.MintZenSessionID()
-		e.CreatedAt = now.Unix()
-		e.Minted = true
+		mintZenSessionEntryLocked(e, now)
 		saveZenSessionsLocked()
 		zenSessFailedMu.Lock()
 		delete(zenSessFailed, key)
@@ -381,12 +390,10 @@ func refreshZenSession(key string) {
 	e, ok := zenSessions[key]
 	if !ok {
 		// key 未在会话表里（例如首次即 403）：建一个新条目即可，下次请求复用。
-		e = &zenSessionEntry{UA: zenNativeUA}
+		e = &zenSessionEntry{}
 		zenSessions[key] = e
 	}
-	e.Session = kit.MintZenSessionID()
-	e.CreatedAt = time.Now().Unix()
-	e.Minted = true
+	mintZenSessionEntryLocked(e, time.Now())
 	saveZenSessionsLocked()
 	sess := e.Session
 	zenSessMu.Unlock()
@@ -401,4 +408,96 @@ func zenKeyConfigured(key string) bool {
 		}
 	}
 	return false
+}
+
+// ============ 后台会话巡检（关键：空闲 key 也要保活/轮换） ============
+//
+// 为什么必须有后台巡检：pickZenKey 的第一轮只挑"已经有合法会话"的 key（见
+// zen.go），而会话是在 key 被选中之后、由 StickyZenIdentity 惰性铸造的。这两者
+// 互为条件就会自锁——key#1 被选中→铸造→永远满足第一轮，key#2/3 永不被选中→
+// 永不铸造→永远被跳过。删除收割机后这个不变量就没人维护了：轮转事实上塌缩到
+// 第一个 key，既让其余 key 的额度闲置，也让它们的会话永不轮换（用户看到的
+// "过 2 小时不自动换会话"）。巡检每 key 只做一个 O(1) 的本地铸造/换新，不发
+// 上游请求、不消耗额度、无子进程。
+//
+// 巡检同时覆盖两种状态：
+//   - 无会话/格式非法的 key：立即铸造（让第一轮轮转重新认得它）；
+//   - 年龄超过 SessionRotateMinutes 的 key：重铸（新会话，清 403 印记）。
+//
+// SessionRotateMinutes=0 时关闭"老化轮换"，但仍会为缺会话的 key 补铸——
+// 否则轮转自锁问题会以另一种形式回来（空闲 key 依旧被饿死）。
+
+// zenSessionRotateTick 巡检的基础节拍。轮换周期是分钟级，用 1 分钟轮询即可，
+// 每分钟只做一次 map 遍历 + 少数几次本地铸造，开销可忽略。
+const zenSessionRotateTick = time.Minute
+
+// rotateZenSessionsOnce 巡检一轮：为池中每个配置 key 补齐/轮换会话。
+// 返回 (新铸造数, 轮换数)，供日志与测试断言。
+func rotateZenSessionsOnce() (minted, rotated int) {
+	keys := getZenConfig().Keys
+	if len(keys) == 0 {
+		return 0, 0
+	}
+	iv := sessionRotateInterval()
+	loadZenSessions()
+	zenSessMu.Lock()
+	defer zenSessMu.Unlock()
+	now := time.Now()
+	var rotatedKeys []string
+	for _, k := range keys {
+		if k == "" || k == "public" {
+			continue // 哨兵无凭据，铸造会话只会污染文件
+		}
+		e := zenSessions[k]
+		if e == nil {
+			e = &zenSessionEntry{}
+			zenSessions[k] = e
+		}
+		if !kit.ValidZenSessionID(e.Session) {
+			mintZenSessionEntryLocked(e, now)
+			e.Updated = now.Unix()
+			minted++
+			continue
+		}
+		if iv > 0 && e.CreatedAt > 0 && now.Sub(time.Unix(e.CreatedAt, 0)) >= iv {
+			mintZenSessionEntryLocked(e, now)
+			e.Updated = now.Unix()
+			rotated++
+			rotatedKeys = append(rotatedKeys, k)
+		}
+	}
+	if minted > 0 || rotated > 0 {
+		saveZenSessionsLocked()
+	}
+	if len(rotatedKeys) > 0 {
+		// 轮换过的 key 清掉 403 失败印记（与请求路径语义一致）：新会话是干净状态。
+		zenSessFailedMu.Lock()
+		for _, k := range rotatedKeys {
+			delete(zenSessFailed, k)
+		}
+		zenSessFailedMu.Unlock()
+	}
+	return minted, rotated
+}
+
+// startZenSessionRotator 启动后台会话巡检（每分钟一次），保证所有配置 key 都有
+// 合法且新鲜的会话。与 startZenModelsRefresher 同形态：常驻 goroutine，进程退出
+// 即结束；第一轮在启动后立即执行，冷启动时就把整个池的会话建起来。
+func startZenSessionRotator() {
+	go func() {
+		if minted, rotated := rotateZenSessionsOnce(); minted > 0 || rotated > 0 {
+			log.Printf("zen session rotator: initial pass minted=%d rotated=%d", minted, rotated)
+		}
+		ticker := time.NewTicker(zenSessionRotateTick)
+		defer ticker.Stop()
+		for range ticker.C {
+			if !getZenConfig().Enabled {
+				continue
+			}
+			minted, rotated := rotateZenSessionsOnce()
+			if minted > 0 || rotated > 0 {
+				log.Printf("zen session rotator: minted=%d rotated=%d", minted, rotated)
+			}
+		}
+	}()
 }

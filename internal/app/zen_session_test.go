@@ -448,6 +448,157 @@ func TestSessionRotationClearsFailureMark(t *testing.T) {
 	}
 }
 
+// ============ 后台会话巡检 ============
+
+// 巡检必须为"从未被请求过"的空闲 key 补铸会话。这是 pickZenKey 第一轮只挑
+// live key 所造成的自锁的解药：没有它，key#2/3 永远不被选中、永不铸造。
+func TestRotatorMintsIdleKeys(t *testing.T) {
+	setupZenSessionTest(t)
+	keys := []string{"sk-idle-1", "sk-idle-2", "sk-idle-3"}
+	cfg := getZenConfig()
+	cfg2 := *cfg
+	cfg2.Keys = keys
+	cfg2.SessionRotateMinutes = 120
+	setZenConfig(&cfg2)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
+
+	minted, rotated := rotateZenSessionsOnce()
+	if minted != 3 || rotated != 0 {
+		t.Fatalf("rotator = minted %d rotated %d, want minted 3 rotated 0", minted, rotated)
+	}
+	for _, k := range keys {
+		if !zenSessionLive(k) {
+			t.Fatalf("idle key %q must have a live session after the rotator pass", k)
+		}
+	}
+	// 第二轮无事可做：会话都新鲜，不该重复铸造
+	if m2, r2 := rotateZenSessionsOnce(); m2 != 0 || r2 != 0 {
+		t.Fatalf("second pass must be a no-op, got minted %d rotated %d", m2, r2)
+	}
+}
+
+// 巡检必须轮换年龄超期的 key——即便它从未被请求过（用户报的正是这个）。
+func TestRotatorRotatesAgedIdleKeys(t *testing.T) {
+	setupZenSessionTest(t)
+	key := "sk-aged-idle"
+	cfg := getZenConfig()
+	cfg2 := *cfg
+	cfg2.Keys = []string{key}
+	cfg2.SessionRotateMinutes = 60
+	setZenConfig(&cfg2)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
+
+	rotateZenSessionsOnce()
+	zenSessMu.Lock()
+	before := zenSessions[key].Session
+	zenSessions[key].CreatedAt = time.Now().Add(-3 * time.Hour).Unix()
+	zenSessMu.Unlock()
+
+	minted, rotated := rotateZenSessionsOnce()
+	if minted != 0 || rotated != 1 {
+		t.Fatalf("rotator = minted %d rotated %d, want minted 0 rotated 1", minted, rotated)
+	}
+	zenSessMu.Lock()
+	after := zenSessions[key].Session
+	age := time.Since(time.Unix(zenSessions[key].CreatedAt, 0))
+	zenSessMu.Unlock()
+	if after == before {
+		t.Fatal("aged idle key's session must be re-minted by the rotator")
+	}
+	if age > time.Minute {
+		t.Fatalf("rotated entry must carry a fresh createdAt, age=%v", age)
+	}
+}
+
+// 轮换周期为 0（关闭老化轮换）时，巡检仍须为缺会话的 key 补铸——
+// 否则空闲 key 依旧被 pickZenKey 的第一轮饿死。
+func TestRotatorMintsButDoesNotRotateWhenDisabled(t *testing.T) {
+	setupZenSessionTest(t)
+	key := "sk-norotate-idle"
+	cfg := getZenConfig()
+	cfg2 := *cfg
+	cfg2.Keys = []string{key}
+	cfg2.SessionRotateMinutes = 0
+	setZenConfig(&cfg2)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
+
+	if minted, _ := rotateZenSessionsOnce(); minted != 1 {
+		t.Fatalf("rotator must still mint a missing session when rotation is off, got minted %d", minted)
+	}
+	zenSessMu.Lock()
+	before := zenSessions[key].Session
+	zenSessions[key].CreatedAt = time.Now().Add(-720 * time.Hour).Unix()
+	zenSessMu.Unlock()
+
+	minted, rotated := rotateZenSessionsOnce()
+	if minted != 0 || rotated != 0 {
+		t.Fatalf("rotation disabled: want no work, got minted %d rotated %d", minted, rotated)
+	}
+	zenSessMu.Lock()
+	after := zenSessions[key].Session
+	zenSessMu.Unlock()
+	if after != before {
+		t.Fatal("rotation disabled must keep the existing session")
+	}
+}
+
+// 修复的端到端效果：巡检让整个池都 live 之后，pickZenKey 的第一轮不再塌缩到
+// 第一个 key——轮转能真正在所有 key 之间分发。
+func TestRotatorRestoresKeyRotation(t *testing.T) {
+	setupZenSessionTest(t)
+	keys := []string{"sk-rot-a", "sk-rot-b", "sk-rot-c"}
+	cfg := getZenConfig()
+	cfg2 := *cfg
+	cfg2.Keys = keys
+	cfg2.SessionRotateMinutes = 120
+	setZenConfig(&cfg2)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
+	zenKeyMu.Lock()
+	zenKeyCool = map[string]time.Time{}
+	zenKeyIdx = 0
+	zenKeyMu.Unlock()
+
+	rotateZenSessionsOnce() // 让所有 key 都有 live 会话
+
+	seen := map[string]int{}
+	for i := 0; i < 9; i++ {
+		seen[pickZenKey()]++
+	}
+	if len(seen) != len(keys) {
+		t.Fatalf("pickZenKey must round-robin across all live keys, saw %v", seen)
+	}
+	for _, k := range keys {
+		if seen[k] != 3 {
+			t.Fatalf("key %q picked %d times, want 3 (even round-robin): %v", k, seen[k], seen)
+		}
+	}
+}
+
+// 哨兵与空 key 不参与巡检铸造（无凭据，会话只会污染文件）。
+func TestRotatorSkipsPublicSentinel(t *testing.T) {
+	setupZenSessionTest(t)
+	cfg := getZenConfig()
+	cfg2 := *cfg
+	cfg2.Keys = []string{"public", "sk-real"}
+	cfg2.SessionRotateMinutes = 120
+	setZenConfig(&cfg2)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
+
+	if minted, _ := rotateZenSessionsOnce(); minted != 1 {
+		t.Fatalf("rotator must mint only the real key, got minted %d", minted)
+	}
+	zenSessMu.Lock()
+	_, hasPublic := zenSessions["public"]
+	_, hasReal := zenSessions["sk-real"]
+	zenSessMu.Unlock()
+	if hasPublic {
+		t.Fatal("rotator must not mint a session for the public sentinel")
+	}
+	if !hasReal {
+		t.Fatal("rotator must mint a session for the real key")
+	}
+}
+
 // 掩码不得泄露短 key（kit.Truncate 对短串原样返回）。
 func TestMaskZenKeyNeverLeaksShortKey(t *testing.T) {
 	if m := maskZenKey("sk-1"); contains(m, "sk-1") {
