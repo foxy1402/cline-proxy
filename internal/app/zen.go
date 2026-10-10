@@ -136,6 +136,7 @@ func isZenFreeModel(m *ZenModel) bool {
 //  2. Source=="live" 的最小 id 模型 —— live 条目来自官方目录同步，
 //     是"上游当前确实在供"的证明，种子条目可能早已下架；
 //  3. 任意 free 模型的最小 id —— 冷启动且同步不可达时的纯种子兜底。
+//
 // native-responses 模型也可能被选中——testZenKey 按其 Upstream 字段走对应
 // 上游调用，无需特判。目录为空时返回 nil，探测直接报错。
 func zenProbeModel() *ZenModel {
@@ -247,6 +248,9 @@ type zenConfigData struct {
 	FailoverCount   int              `json:"failoverCount"`   // 触发故障转移的连续失败次数,默认 3
 	FailoverMinutes int              `json:"failoverMinutes"` // 故障转移窗口(分钟),默认 5
 	Compaction      zenCompactConfig `json:"compaction"`
+	// SessionRotateMinutes 粘性会话本地轮换周期（分钟），默认 120（2 小时）。
+	// 0 = 永不轮换（沿用旧行为，长跑后首个请求会因会话老化而变慢）。
+	SessionRotateMinutes int `json:"sessionRotateMinutes"`
 }
 
 func defaultZenConfig() *zenConfigData {
@@ -261,6 +265,9 @@ func defaultZenConfig() *zenConfigData {
 		Failover:        true,
 		FailoverCount:   3,
 		FailoverMinutes: 5,
+		// 会话轮换周期：缺少该键的旧配置文件保持此默认（2 小时）。
+		// 显式写 0 表示关闭轮换（见 SessionRotateMinutes 注释）。
+		SessionRotateMinutes: defaultSessionRotateMinutes,
 		Compaction: zenCompactConfig{
 			Auto:       true,
 			Buffer:     20000,
@@ -404,6 +411,12 @@ func loadZenConfig() *zenConfigData {
 			cfg.Keys = envKeys
 			log.Printf("zen keys seeded from ZEN_KEYS env: %d key(s)", len(envKeys))
 		}
+	}
+	// ZEN_SESSION_ROTATE_MINUTES 覆盖会话轮换周期（分钟，0=关闭）。
+	// 与 POOL_STRATEGY 同语义：env 显式设置时总是覆盖持久化配置。
+	if n, ok := envInt("ZEN_SESSION_ROTATE_MINUTES"); ok {
+		cfg.SessionRotateMinutes = n
+		log.Printf("zen session rotation interval set from env: %d min", n)
 	}
 	normalizeZenKeys(cfg)
 	if cfg.BaseURL == "" {
@@ -744,7 +757,7 @@ func pinnedZenKey() string {
 
 // zenGateToolSpecs 免费层两个端点必须携带的 opencode 工具集（工具名与官方
 // CLI 一致）。FreeTier 中间件按工具名校验"请求是否来自 opencode CLI"
-//（2026-09-18 实测解码：缺工具/工具名不齐 → 403 FreeTierError，即使会话
+// （2026-09-18 实测解码：缺工具/工具名不齐 → 403 FreeTierError，即使会话
 // 有效；乱序、假描述、仅核心 5 名(bash/edit/glob/grep/read)也通过）。
 // 描述用精简占位即可——工具注入后模型在 tool_choice=none（chat）或
 // 文本语义（responses）下不产生实质工具调用，回复保持纯文本。
@@ -1218,6 +1231,7 @@ func responsesContentToInput(content any) any {
 //     reasoning_summary_text.delta（逐块增量文本）
 //   - output_item.done：response.output_item.done 内 item.content[].text 全量
 //     文本（muse-spark 对纯文本问答只发该事件，无 delta 流）
+//
 // usage 从 response.completed 或 response.incomplete 提取；
 // incomplete_details.reason 映射为 finish 原因（length→length）。
 // zenSSECall 单个 function_call 输出项的流式累积器。上游可能并行/连续输出
@@ -1588,6 +1602,7 @@ func responsesSSEToChat(resp *http.Response) (map[string]any, error) {
 //   - stream=true 时返回原生 SSE 流（调用方自行转换呈现）
 //   - stream=false 时在内部把 SSE 聚合成 chat completions 形态返回，
 //     响应体可直接按 chat 结构解码
+//
 // 返回 (响应, 命中限流次数, 错误)。
 //
 // prompt_cache_key 绑定本次上游会话：官方 CLI 发 prompt_cache_key=<会话 ID>
@@ -1622,8 +1637,8 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 	}
 	delay := time.Second
 	rateLimited := 0
-	retryKey := ""       // 非空时重试沿用该 key（保持 key sess_ 一致）
-	remapped := false    // 410 弃用迁移至多一次，防别名链循环
+	retryKey := ""          // 非空时重试沿用该 key（保持 key sess_ 一致）
+	remapped := false       // 410 弃用迁移至多一次，防别名链循环
 	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
 
 	for attempt := 0; ; attempt++ {
@@ -2252,8 +2267,9 @@ func zenDesiredFromLive(registryOK bool, freeGate map[string]bool) (map[string]b
 //     内嵌 CLI 的成员表兜底已随收割机一起移除。
 //  3. 限额 overlay：目录 limit.context/output + tool_call / reasoning /
 //     attachment 旗标 + per-model provider.npm（端点种子，见 applyZenCatalog）。
+//
 // 增删一律以本次 live 结果为准：表中的种子条目若不再通过价格门会被移除
-//（种子只在首次成功同步之前的冷启动/离线状态提供兜底，不参与日常增删）。
+// （种子只在首次成功同步之前的冷启动/离线状态提供兜底，不参与日常增删）。
 // 返回新增模型数。
 func syncZenModels() (int, error) {
 	initZenModels()

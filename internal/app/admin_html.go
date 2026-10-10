@@ -562,12 +562,15 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div class="flex" style="gap:10px;margin-bottom:8px;align-items:center;flex-wrap:wrap">
       <label class="hint" style="margin:0">Probe model (used by the Test buttons):</label>
-      <select id="ocProbeModel" style="max-width:360px"><option value="">auto — big-pickle first, then live models</option></select>
+      <select id="ocProbeModel" style="max-width:300px"><option value="">auto — big-pickle first, then live models</option></select>
+      <label class="hint" style="margin:0 0 0 6px">Session rotation (min):</label>
+      <input type="text" id="ocSessionRotate" placeholder="120" style="max-width:90px" title="Mint a fresh session id for a key once it is this old. 0 = never rotate (a long-lived session makes the first request slow after a few days).">
     </div>
+    <p class="hint" style="margin-top:0">Per-key session state is shown in the table below. Session IDs are minted locally and match the upstream's format gate (<code>^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$</code>) — no CLI or harvester involved. On repeated FreeTier 403s, or once a session is older than the rotation interval, a key's session is refreshed with a freshly minted one automatically.</p>
     <div class="table-wrap" style="margin-bottom:10px">
       <table>
-        <thead><tr><th style="width:50px">#</th><th style="width:110px">Key</th><th style="width:70px">Usage</th><th style="width:110px">Session</th><th>Cooldown</th><th style="width:90px"></th></tr></thead>
-        <tbody id="ocKeysBody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+        <thead><tr><th style="width:44px">#</th><th style="width:100px">Key</th><th style="width:60px">Usage</th><th style="width:170px">Session</th><th style="width:110px">Rotates</th><th>Cooldown</th><th style="width:84px"></th></tr></thead>
+        <tbody id="ocKeysBody"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
     <div class="form-row">
@@ -620,25 +623,6 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>Summary cap</label><input type="text" id="ocMaxSummary" placeholder="4096"></div>
     </div>
     <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">Save compaction config</button></div>
-  </div>
-</div>
-
-<div class="section">
-  <div class="section-title"><span class="sec-ico"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span> Live session IDs (zen FreeTier gate)
-    <span id="ocSessSummary" class="probe-pill" style="font-weight:normal;margin-left:auto"></span>
-  </div>
-  <div class="section-body">
-    <p class="hint" style="margin-top:0" id="ocSessHint">Session IDs are minted locally and match the upstream's format gate (^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$) — no CLI or harvester involved. On repeated FreeTier 403s a key's session is refreshed with a freshly minted one automatically.</p>
-    <div class="flex" style="gap:10px;margin-bottom:10px;flex-wrap:wrap">
-      <span class="hint" style="margin:0" id="ocSessTimer"></span>
-    </div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th style="width:70px">Key</th><th style="width:130px">Session</th><th style="width:150px">State</th><th>Created</th></tr></thead>
-        <tbody id="ocSessBody"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
-      </table>
-    </div>
-    <div id="ocSessResult" style="margin-top:10px"></div>
   </div>
 </div>
 
@@ -737,7 +721,7 @@ document.querySelectorAll('.nav-item').forEach(el => {
     if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); }
     if (el.dataset.tab === 'logs') loadLogs();
     if (el.dataset.tab === 'proxypool') loadProxyPool();
-    if (el.dataset.tab === 'opencode') { loadOcConfig(); loadOcModels(); loadOcStats(); loadOcSessions(); }
+    if (el.dataset.tab === 'opencode') { loadOcConfig(); loadOcModels(); loadOcStats(); }
     if (el.dataset.tab === 'combos') { loadCombos(); fillComboModels(); }
   });
 });
@@ -753,7 +737,7 @@ function switchTab(name) {
   if (name === 'settings') { loadKeys(); loadModels(); }
   if (name === 'logs') loadLogs();
   if (name === 'proxypool') loadProxyPool();
-  if (name === 'opencode') { loadOcConfig(); loadOcModels(); loadOcStats(); loadOcSessions(); }
+  if (name === 'opencode') { loadOcConfig(); loadOcModels(); loadOcStats(); }
   if (name === 'combos') { loadCombos(); fillComboModels(); }
 }
 
@@ -1310,6 +1294,7 @@ async function loadOcConfig() {
     _('ocFailover').value = String(c.failover);
     _('ocFailoverCount').value = c.failoverCount || 3;
     _('ocFailoverMinutes').value = c.failoverMinutes || 5;
+    if (_('ocSessionRotate')) _('ocSessionRotate').value = (c.sessionRotateMinutes != null ? c.sessionRotateMinutes : 120);
     _('ocCompactAuto').value = String(c.compaction ? c.compaction.auto : true);
     _('ocCompactBuffer').value = c.compaction ? c.compaction.buffer : 20000;
     _('ocKeepTokens').value = c.compaction ? c.compaction.keepTokens : 8000;
@@ -1325,6 +1310,9 @@ async function loadOcConfig() {
 async function saveOcConfig() {
   const keys = _('ocKeys').value.split('\n').map(s => s.trim()).filter(Boolean);
   if (!keys.length) { toast('API keys must not be empty (use "public" if you have no key)', 'error'); return; }
+  // 会话轮换周期：空 = 默认 120；"0" = 关闭轮换（合法值，不能与空混淆）。
+  const rotRaw = _('ocSessionRotate') ? _('ocSessionRotate').value.trim() : '';
+  const rot = rotRaw === '' ? 120 : Math.max(0, parseInt(rotRaw, 10) || 0);
   const body = {
     enabled: _('ocEnabled').value === 'true',
     keys: keys,
@@ -1336,6 +1324,7 @@ async function saveOcConfig() {
     failover: _('ocFailover').value === 'true',
     failoverCount: parseInt(_('ocFailoverCount').value) || 3,
     failoverMinutes: parseInt(_('ocFailoverMinutes').value) || 5,
+    sessionRotateMinutes: rot,
     compaction: {
       auto: _('ocCompactAuto').value === 'true',
       buffer: parseInt(_('ocCompactBuffer').value) || 20000,
@@ -1351,27 +1340,40 @@ async function saveOcConfig() {
   } catch (e) { toast('Save failed: ' + e.message, 'error'); }
 }
 
-// per-key 状态表：key 掩码 / 用量 / 会话 / 冷却（含预计恢复时刻）/ Test 按钮。
-// Test 与 cline 账号的同语义：真实探测，成功即复位该 key 的冷却。
+// per-key 状态表：key 掩码 / 用量 / 会话（ID + live 状态 + 下次轮换时刻）/
+// 冷却（含预计恢复时刻）/ Test 按钮。会话列与"上游配置"合并在同一张表里，
+// 不再有独立的会话面板。Test 与 cline 账号的同语义：真实探测，成功即复位冷却。
 function renderOcKeyStates(ks) {
   const tb = _('ocKeysBody');
   if (!tb) return;
+  const rotateMin = ocCfgCache.sessionRotateMinutes || 0;
   tb.innerHTML = ks.length
     ? ks.map(k => {
         const st = k.sessionLive
           ? '<span style="color:var(--accent2)">live</span>'
           : '<span style="color:var(--danger)">no session</span>';
+        const sess = k.session
+          ? '<span style="font-family:monospace;font-size:11px">' + esc(k.session) + '…</span> ' + st
+          : (k.keyMask === 'public (no key)' ? '<span style="color:var(--text2)">n/a</span>' : st);
+        let rot = '<span style="color:var(--text2)">-</span>';
+        if (rotateMin > 0 && k.sessionCreatedAt) {
+          const due = new Date(new Date(k.sessionCreatedAt).getTime() + rotateMin * 60000);
+          rot = '<span style="font-size:11px" title="session minted ' + esc(fmtWhen(k.sessionCreatedAt)) + '">' + esc(fmtWhen(due.toISOString())) + '</span>';
+        } else if (rotateMin === 0) {
+          rot = '<span style="color:var(--text2)" title="rotation disabled">never</span>';
+        }
         const cool = k.cooling
           ? '<span style="color:var(--danger)">cooling' + (k.cooldownUntil ? ' · until ' + esc(fmtWhen(k.cooldownUntil)) : '') + '</span>'
           : '<span style="color:var(--text2)">-</span>';
         return '<tr><td>#' + (k.index + 1) + (k.current ? ' <span style="color:var(--accent)" title="next in rotation">●</span>' : '') + '</td>' +
           '<td style="font-family:monospace;font-size:11px">' + esc(k.keyMask) + '</td>' +
           '<td>' + (k.usage || 0) + '</td>' +
-          '<td>' + st + '</td>' +
+          '<td>' + sess + '</td>' +
+          '<td>' + rot + '</td>' +
           '<td>' + cool + '</td>' +
           '<td>' + (k.keyMask === 'public (no key)' ? '' : '<button class="btn btn-sm" data-zk="' + k.index + '">Test</button>') + '</td></tr>';
       }).join('')
-    : '<tr><td colspan="6" class="empty">No zen keys configured</td></tr>';
+    : '<tr><td colspan="7" class="empty">No zen keys configured</td></tr>';
   tb.onclick = e => {
     const b = e.target.closest('button[data-zk]');
     if (b) testZenKey(parseInt(b.dataset.zk, 10), b);
@@ -1464,42 +1466,6 @@ async function loadOcModels() {
       if (Array.from(sel.options).some(o => o.value === prev)) sel.value = prev;
     }
   } catch (e) { _('ocModelsList').textContent = 'Failed to load'; }
-}
-
-// ========== Live session IDs (zen FreeTier gate) ==========
-// 会话由本地铸造、格式即凭证；表格让每个 key 的会话状态一眼可见。
-// mint 任务已随收割机移除；可见标签页轮询照常刷新会话表。
-let ocSessPoll = null;
-
-async function loadOcSessions() {
-  try {
-    const d = await api('GET', '/opencode/sessions');
-    renderOcSessions(d.data);
-    return d.data;
-  } catch (e) { return null; }
-}
-
-function renderOcSessions(s) {
-  const rows = s.sessions || [];
-  _('ocSessSummary').innerHTML = rows.length
-    ? '<span style="color:' + (s.liveCount === s.total ? 'var(--accent2)' : 'var(--danger)') + '">' +
-      s.liveCount + '/' + s.total + ' live</span>'
-    : '';
-  _('ocSessBody').innerHTML = rows.length
-    ? rows.map(k => {
-        const state = k.noKey
-          ? '<span style="color:var(--text2)">no key</span>'
-          : (k.live
-              ? '<span style="color:var(--accent2)">live</span>'
-              : '<span style="color:var(--danger)">no session</span>');
-        return '<tr><td>#' + (k.index + 1) + '</td>' +
-          '<td style="font-family:monospace;font-size:11px">' + (k.session ? esc(k.session) + '…' : '-') + '</td>' +
-          '<td>' + state + '</td>' +
-          '<td style="font-size:12px">' + (k.created ? esc(fmtWhen(k.created)) : '-') + '</td></tr>';
-      }).join('')
-    : '<tr><td colspan="4" class="empty">No zen keys configured</td></tr>';
-  _('ocSessTimer').textContent = '';
-  _('ocSessResult').innerHTML = '';
 }
 
 // ========== Combos (alias models) ==========
@@ -1601,10 +1567,6 @@ loadModels();
 loadConfig();
 setInterval(() => { loadStats(); }, 10000);
 setInterval(() => { loadOcStats(); }, 15000);
-// live 会话状态：只在 opencode 页可见时轮询（与日志页同样的省流约定）。
-setInterval(() => {
-  if (_('tab-opencode').style.display !== 'none' && !ocSessPoll) loadOcSessions();
-}, 20000);
 setInterval(() => { if (logsAuto && _('tab-logs').style.display !== 'none') loadLogs(); }, 8000);
 </script>
 </body>

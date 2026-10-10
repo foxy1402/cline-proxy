@@ -24,19 +24,20 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := getZenConfig()
 	data := map[string]any{
-		"enabled":         cfg.Enabled,
-		"key":             cfg.Key,
-		"keys":            cfg.Keys,
-		"keyStates":       zenKeyStatus(),
-		"baseURL":         cfg.BaseURL,
-		"proxies":         cfg.Proxies,
-		"proxyStrategy":   cfg.ProxyStrategy,
-		"maxConcurrency":  cfg.MaxConcurrency,
-		"retries":         cfg.Retries,
-		"failover":        cfg.Failover,
-		"failoverCount":   cfg.FailoverCount,
-		"failoverMinutes": cfg.FailoverMinutes,
-		"compaction":      cfg.Compaction,
+		"enabled":              cfg.Enabled,
+		"key":                  cfg.Key,
+		"keys":                 cfg.Keys,
+		"keyStates":            zenKeyStatus(),
+		"baseURL":              cfg.BaseURL,
+		"proxies":              cfg.Proxies,
+		"proxyStrategy":        cfg.ProxyStrategy,
+		"maxConcurrency":       cfg.MaxConcurrency,
+		"retries":              cfg.Retries,
+		"failover":             cfg.Failover,
+		"failoverCount":        cfg.FailoverCount,
+		"failoverMinutes":      cfg.FailoverMinutes,
+		"compaction":           cfg.Compaction,
+		"sessionRotateMinutes": cfg.SessionRotateMinutes,
 		"runtime": map[string]any{
 			"failoverActive": zenFailedNow(),
 			"proxyCooldowns": zenProxyCooldownStatus(),
@@ -71,7 +72,9 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		Failover        *bool    `json:"failover"`
 		FailoverCount   *int     `json:"failoverCount"`
 		FailoverMinutes *int     `json:"failoverMinutes"`
-		Compaction      *struct {
+		// 会话轮换周期（分钟）：0 = 关闭轮换，需与"未提交"区分故用指针。
+		SessionRotateMinutes *int `json:"sessionRotateMinutes"`
+		Compaction           *struct {
 			Auto         *bool   `json:"auto"`
 			Buffer       *int    `json:"buffer"`
 			KeepTokens   *int    `json:"keepTokens"`
@@ -84,18 +87,19 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := &zenConfigData{
-		Enabled:         cur.Enabled,
-		Key:             cur.Key,
-		Keys:            cur.Keys,
-		BaseURL:         cur.BaseURL,
-		Proxies:         cur.Proxies,
-		ProxyStrategy:   cur.ProxyStrategy,
-		MaxConcurrency:  cur.MaxConcurrency,
-		Retries:         cur.Retries,
-		Failover:        cur.Failover,
-		FailoverCount:   cur.FailoverCount,
-		FailoverMinutes: cur.FailoverMinutes,
-		Compaction:      cur.Compaction,
+		Enabled:              cur.Enabled,
+		Key:                  cur.Key,
+		Keys:                 cur.Keys,
+		BaseURL:              cur.BaseURL,
+		Proxies:              cur.Proxies,
+		ProxyStrategy:        cur.ProxyStrategy,
+		MaxConcurrency:       cur.MaxConcurrency,
+		Retries:              cur.Retries,
+		Failover:             cur.Failover,
+		FailoverCount:        cur.FailoverCount,
+		FailoverMinutes:      cur.FailoverMinutes,
+		Compaction:           cur.Compaction,
+		SessionRotateMinutes: cur.SessionRotateMinutes,
 	}
 	if patch.Enabled != nil {
 		next.Enabled = *patch.Enabled
@@ -141,6 +145,10 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.FailoverMinutes != nil && *patch.FailoverMinutes > 0 {
 		next.FailoverMinutes = *patch.FailoverMinutes
+	}
+	// 0 是合法值（关闭轮换），不能用 > 0 过滤；负值视为无效忽略。
+	if patch.SessionRotateMinutes != nil && *patch.SessionRotateMinutes >= 0 {
+		next.SessionRotateMinutes = *patch.SessionRotateMinutes
 	}
 	if patch.Compaction != nil {
 		base := cur.Compaction
@@ -215,42 +223,6 @@ func handleZenStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: zenStatsSnapshot()})
-}
-
-// GET /admin/api/zen/sessions
-// 每个 key 的 live 会话状态（本地铸造，无收割任务概念）。
-func handleZenSessions(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
-		return
-	}
-	keys := getZenConfig().Keys
-	sessions := make([]map[string]any, 0, len(keys))
-	live := 0
-	for i, k := range keys {
-		s := zenSessionSnapshotOf(k)
-		if s.Live {
-			live++
-		}
-		entry := map[string]any{
-			"index":   i,
-			"keyMask": maskZenKey(k),
-			"noKey":   k == "" || k == "public",
-			"live":    s.Live,
-			"session": s.Session,
-			"created": "",
-		}
-		if s.CreatedAt > 0 {
-			entry["created"] = time.Unix(s.CreatedAt, 0).Format(time.RFC3339)
-		}
-		sessions = append(sessions, entry)
-	}
-	data := map[string]any{
-		"liveCount": live,
-		"total":     len(keys),
-		"sessions":  sessions,
-	}
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: data})
 }
 
 // POST /admin/api/zen/keys/test   body: {"index": 0}

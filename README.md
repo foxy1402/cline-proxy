@@ -111,6 +111,7 @@ All state lives in the `/app/data` volume — dotfiles written `0600`: `.cline-a
 | `STRICT_MODEL_MATCH` | `true` | `400` for unknown model names instead of silently serving the default model |
 | `POOL_STRATEGY` | `round_robin` | Cline account strategy: `round_robin` / `fill` / `random` (env wins over panel config) |
 | `ZEN_KEYS` | empty | opencode zen keys, comma-separated; panel config is not overwritten when it already has keys |
+| `ZEN_SESSION_ROTATE_MINUTES` | `120` | Re-mint a key's sticky zen session once it is this old (minutes); `0` disables rotation |
 | `CLINE_ACCOUNTS_SEED_FILE` | empty | Seed JSON imported at boot when the pool is empty |
 | `CLINE_USE_PROXIES` | `false` | Route the Cline upstream through the egress proxy pool |
 | `LOG_REQUESTS` | `true` | Request logging (metadata only: IP, path, model, status, duration — never conversation content) |
@@ -128,13 +129,16 @@ Zen session IDs are **minted locally** — the upstream's free-tier gate is a st
 
 On repeated FreeTier `403`s the key's session is refreshed with a freshly minted one automatically (2 consecutive 403s trigger it, 1-minute per-key backoff); a sustained rise in the refresh rate in the logs is the tripwire that zen has tightened its gate.
 
+Sessions also **rotate on age**: after `ZEN_SESSION_ROTATE_MINUTES` (default 120 = 2 h) a key's session is re-minted on its next request. An upstream session that has gone stale makes its first request noticeably slower even though the gateway still accepts it; a periodic local re-mint keeps that latency off the user's path. Rotation is triggered lazily on the request path (no background task) and is free — the ID is minted locally, so nothing is sent upstream and no quota is consumed. Set the value to `0` to disable rotation. The same interval is editable in the panel's opencode tab ("Session rotation (min)").
+
 The zen route table is seeded deterministically from the model catalog's SDK package name (`provider.npm`: `@ai-sdk/openai` → native `/v1/responses`, `@ai-sdk/openai-compatible` → `/chat/completions`) and refined per model by the endpoint learner, whose decisions persist in `.zen-endpoints.json` and are never overwritten by later catalog syncs.
 
 | Variable | Default | Description |
 |---|---|---|
 | `ZEN_PIN_KEY` | empty | Troubleshooting: pin all upstream attempts to key number *n* (1-based) instead of rotating, so one key can be tested in isolation |
+| `ZEN_SESSION_ROTATE_MINUTES` | `120` | Re-mint a key's sticky session once it is this old (minutes); `0` disables rotation (also editable in the panel) |
 
-The admin panel's opencode tab shows per-key session liveness and age plus a per-key **Test** button with a probe-model picker (default **auto**: big-pickle first, then live-synced models; any free zen model can be chosen): it sends one real probe request pinned to that key, and on success clears the key's cooldown immediately (a rate-limited answer — 429, or a 403/503 whose body zen words as a limit — reports the upstream's expected recovery time instead). Note a successful probe consumes one request of that key's quota — the same trade-off as the cline Test button.
+The admin panel's opencode tab shows per-key session liveness, age and next rotation, plus a per-key **Test** button with a probe-model picker (default **auto**: big-pickle first, then live-synced models; any free zen model can be chosen): it sends one real probe request pinned to that key, and on success clears the key's cooldown immediately (a rate-limited answer — 429, or a 403/503 whose body zen words as a limit — reports the upstream's expected recovery time instead). Note a successful probe consumes one request of that key's quota — the same trade-off as the cline Test button.
 
 ## Connecting your IDE
 

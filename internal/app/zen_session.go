@@ -58,6 +58,11 @@ var (
 	zenNativeUA = "opencode/1.18.35 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
 )
 
+// defaultSessionRotateMinutes 粘性会话的默认轮换周期（分钟）。语义见
+// zenConfigData.SessionRotateMinutes：上游对"长期未更新的会话"首个请求会变慢，
+// 定期重铸可避免这个延迟；本地铸造零成本（无子进程、无额度消耗）。
+const defaultSessionRotateMinutes = 120
+
 // zenSessionFile 会话持久化路径（DATA_DIR 优先，容器 volume 挂载点）。
 func zenSessionFile() string {
 	if zenSessPath == "" {
@@ -92,7 +97,7 @@ func loadZenSessions() {
 		log.Printf("zen sessions parse failed, starting fresh (backup: %s.corrupt): %v", zenSessionFile(), err)
 		return
 	}
-	replaced, migrated := 0, 0
+	replaced, migrated, stamped := 0, 0, 0
 	now := time.Now().Unix()
 	for k, e := range m {
 		if e == nil || e.Session == "" {
@@ -107,6 +112,12 @@ func loadZenSessions() {
 			if !e.Minted {
 				e.Minted = true
 				migrated++
+			}
+			// 无创建时间的旧条目：以加载时刻起算轮换时钟，否则老化轮换对它永久失效
+			// （CreatedAt==0 被判为"年龄未知"而跳过）。只在真有会话时才补。
+			if e.CreatedAt == 0 {
+				e.CreatedAt = now
+				stamped++
 			}
 		} else {
 			// sess_* 占位等非法格式：今天就在 403，永远不会自愈，直接换成
@@ -127,7 +138,10 @@ func loadZenSessions() {
 	if migrated > 0 {
 		log.Printf("zen sessions migrated: %d entry(ies) marked minted from session id format", migrated)
 	}
-	if replaced > 0 || migrated > 0 {
+	if stamped > 0 {
+		log.Printf("zen sessions migrated: %d entry(ies) stamped with a rotation clock (createdAt=load time)", stamped)
+	}
+	if replaced > 0 || migrated > 0 || stamped > 0 {
 		saveZenSessionsLocked()
 	}
 }
@@ -222,25 +236,53 @@ func zenSessionDesc(key string) string {
 	}
 }
 
+// sessionRotateInterval 会话轮换周期；0（或负）表示关闭轮换。
+func sessionRotateInterval() time.Duration {
+	n := getZenConfig().SessionRotateMinutes
+	if n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Minute
+}
+
 // StickyZenIdentity 取 key 绑定的稳定身份：会话 ID 与 UA 跨请求复用，
 // 请求 ID 每次全新（与官方 CLI 语义一致：同会话内多 msg_）。
 // 返回 (session, request, user-agent)。
+//
+// 会话老化轮换：条目年龄超过 SessionRotateMinutes 时在请求路径上重铸（同步、
+// 零成本）——上游对久未更新的会话首个请求会明显变慢，定期换新可把它挡在用户
+// 感知之前。轮换只在真正用到该 key 时发生，不额外起后台任务。
 func StickyZenIdentity(key string) (sess, req, ua string) {
 	loadZenSessions()
+	// 轮换周期先读（会取 zenConfigMu），再进 zenSessMu：与 zenKeyStatus 同约定，
+	// 两把锁不嵌套，避免今后任一路径反向加锁时死锁。
+	iv := sessionRotateInterval()
 	zenSessMu.Lock()
 	defer zenSessMu.Unlock()
+	now := time.Now()
 	e, ok := zenSessions[key]
 	if !ok || e.Session == "" {
 		e = &zenSessionEntry{
 			Session:   kit.MintZenSessionID(),
 			UA:        zenNativeUA,
-			CreatedAt: time.Now().Unix(),
+			CreatedAt: now.Unix(),
 		}
 		zenSessions[key] = e
 		saveZenSessionsLocked()
 		log.Printf("zen sticky session minted locally for key#%d: %s", keyIndex(key), kit.Truncate(e.Session, 24))
+	} else if iv > 0 && e.CreatedAt > 0 && now.Sub(time.Unix(e.CreatedAt, 0)) >= iv {
+		// 老化轮换：重铸会话（保留 UA），并清掉 403 失败印记——新会话是干净状态。
+		age := now.Sub(time.Unix(e.CreatedAt, 0)).Round(time.Minute)
+		e.Session = kit.MintZenSessionID()
+		e.CreatedAt = now.Unix()
+		e.Minted = true
+		saveZenSessionsLocked()
+		zenSessFailedMu.Lock()
+		delete(zenSessFailed, key)
+		zenSessFailedMu.Unlock()
+		log.Printf("zen session rotated after %v for key#%d: %s", age, keyIndex(key), kit.Truncate(e.Session, 24))
 	}
-	e.Updated = time.Now().Unix()
+	e.Updated = now.Unix()
 	// 补 UA：旧版本文件或外部改写的条目可能缺这一项，空 UA 发出会被上游
 	// 按非 CLI 流量处理。UA 属于客户端指纹，须与会话铸造时一致。
 	if e.UA == "" {

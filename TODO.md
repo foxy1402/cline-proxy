@@ -1,5 +1,27 @@
 # TODO — Public container deployment: stateless /v1 proxy with multi-account rotation
 
+## Zen session rotation + dashboard consolidation (2026-10-10)
+
+- **Session rotation**: a zen key's sticky session is re-minted once older than
+  `ZEN_SESSION_ROTATE_MINUTES` (default 120 = 2 h, `0` = never). Long-lived
+  upstream sessions make the first request noticeably slow after a few days even
+  though the gateway still accepts them; rotating on the request path (lazily,
+  not a background task) keeps that latency off the user's path. Zero cost — the
+  ID is minted locally, nothing is sent upstream and no quota is consumed.
+  Plumbed through `zenConfigData.SessionRotateMinutes`, the admin
+  `opencode/config` GET/POST (pointer patch so an explicit `0` survives), and the
+  panel's "Session rotation (min)" field. Rotation also clears the key's 403
+  failure mark. Entries loaded without a `createdAt` (legacy files) are stamped
+  with load time so their rotation clock starts instead of never firing.
+- **Dashboard merge**: the standalone "Live session IDs (zen FreeTier gate)"
+  section is gone. Per-key session state (masked ID, live/cooldown, next
+  rotation) now lives in the key table of the "Upstream config" section, so the
+  opencode tab is one config surface instead of two overlapping ones. The
+  `/admin/api/{opencode,zen}/sessions` endpoints and their poller were removed;
+  `zenKeyStatus()` (returned inside `/opencode/config`) already carries the data.
+
+## Zen sessions minted locally; harvester deleted (2026-10-08)
+
 ## Scope (the product)
 
 Expose `/v1` as a simple stateless OpenAI-compatible endpoint for coding IDEs

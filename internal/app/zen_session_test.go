@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -348,6 +349,102 @@ func TestCorruptSessionFileIsBackedUp(t *testing.T) {
 	zenSessMu.Unlock()
 	if n != 0 {
 		t.Fatalf("corrupt file must start with an empty table, got %d entries", n)
+	}
+}
+
+// ============ 会话老化轮换 ============
+
+// setupRotateTest 绑定一个 key 并把轮换周期设为 want 分钟，返回原始配置回滚函数。
+func setupRotateTest(t *testing.T, key string, want int) {
+	t.Helper()
+	cfg := getZenConfig()
+	cfg2 := *cfg
+	cfg2.Keys = []string{key}
+	cfg2.SessionRotateMinutes = want
+	setZenConfig(&cfg2)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
+}
+
+// 默认轮换周期是 120 分钟：旧配置文件缺该键时必须回落到默认值。
+func TestSessionRotateDefaultIsTwoHours(t *testing.T) {
+	if defaultSessionRotateMinutes != 120 {
+		t.Fatalf("defaultSessionRotateMinutes = %d, want 120", defaultSessionRotateMinutes)
+	}
+	// loadZenConfig 的做法：先取 defaultZenConfig，再用文件 JSON 覆盖它。
+	// 缺 sessionRotateMinutes 键的旧文件因此保留默认 120（而不是被置 0）。
+	cfg := defaultZenConfig()
+	if err := json.Unmarshal([]byte(`{"enabled":true,"keys":["sk-x"]}`), cfg); err != nil {
+		t.Fatalf("unmarshal legacy config: %v", err)
+	}
+	if cfg.SessionRotateMinutes != 120 {
+		t.Fatalf("legacy config without the key must keep the 120-minute default, got %d", cfg.SessionRotateMinutes)
+	}
+}
+
+// 超过轮换周期的会话在下一次请求时被重铸；同 key 复用的会话在周期内保持不变。
+func TestSessionRotatesWhenOlderThanInterval(t *testing.T) {
+	setupZenSessionTest(t)
+	key := "sk-rotate"
+	setupRotateTest(t, key, 120)
+
+	first, _, _ := StickyZenIdentity(key)
+	// 未超期：立即再取必须复用同一会话
+	again, _, _ := StickyZenIdentity(key)
+	if again != first {
+		t.Fatalf("session must be reused within the interval: %s -> %s", first, again)
+	}
+
+	// 人为把创建时间拨回到 3 小时前 → 超期
+	zenSessMu.Lock()
+	zenSessions[key].CreatedAt = time.Now().Add(-3 * time.Hour).Unix()
+	zenSessMu.Unlock()
+	rotated, _, _ := StickyZenIdentity(key)
+	if rotated == first {
+		t.Fatal("session older than the rotate interval must be re-minted")
+	}
+	if !kit.ValidZenSessionID(rotated) || !zenSessionLive(key) {
+		t.Fatalf("rotated session must be format-valid: %q", rotated)
+	}
+	// 轮换后创建时间被刷新：紧接着的请求不再重复轮换
+	after, _, _ := StickyZenIdentity(key)
+	if after != rotated {
+		t.Fatalf("freshly rotated session must be stable: %s -> %s", rotated, after)
+	}
+}
+
+// 轮换周期为 0：关闭轮换，再老的会话也复用（与旧行为一致）。
+func TestSessionRotationDisabledAtZero(t *testing.T) {
+	setupZenSessionTest(t)
+	key := "sk-norotate"
+	setupRotateTest(t, key, 0)
+
+	first, _, _ := StickyZenIdentity(key)
+	zenSessMu.Lock()
+	zenSessions[key].CreatedAt = time.Now().Add(-240 * time.Hour).Unix()
+	zenSessMu.Unlock()
+	got, _, _ := StickyZenIdentity(key)
+	if got != first {
+		t.Fatalf("rotation disabled (0) must keep the session forever: %s -> %s", first, got)
+	}
+}
+
+// 老化轮换同时清除该 key 的 403 失败印记（新会话 = 干净状态）。
+func TestSessionRotationClearsFailureMark(t *testing.T) {
+	setupZenSessionTest(t)
+	key := "sk-rotate-fail"
+	setupRotateTest(t, key, 60)
+
+	StickyZenIdentity(key)
+	zenSessionFailed(key)
+	zenSessMu.Lock()
+	zenSessions[key].CreatedAt = time.Now().Add(-2 * time.Hour).Unix()
+	zenSessMu.Unlock()
+	StickyZenIdentity(key)
+	zenSessFailedMu.Lock()
+	_, marked := zenSessFailed[key]
+	zenSessFailedMu.Unlock()
+	if marked {
+		t.Fatal("rotation must clear the key's 403 failure mark")
 	}
 }
 

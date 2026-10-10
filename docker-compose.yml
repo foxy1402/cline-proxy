@@ -22,7 +22,10 @@ services:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
       # opencode zen keys, comma-separated (optional; can also be set in the admin panel)
       - ZEN_KEYS=${ZEN_KEYS:-}
-      # Zen session IDs are minted locally (no harvester, no CLI, no extra env).
+      # Zen session IDs are minted locally (no harvester, no CLI). A key's session
+      # is re-minted once older than this many minutes (0 = never rotate); avoids
+      # the slow first request a stale upstream session causes. Default 120.
+      - ZEN_SESSION_ROTATE_MINUTES=${ZEN_SESSION_ROTATE_MINUTES:-120}
       # Account pool strategy, default round_robin (fill / random)
       - POOL_STRATEGY=${POOL_STRATEGY:-round_robin}
       # Request-log switch, default on (metadata only, 10MB cap auto-wipe)
