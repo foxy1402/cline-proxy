@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -83,25 +84,46 @@ func zenDeprecationFromError(status int, body string) (replacement string) {
 	return ""
 }
 
-// zenExtractReplacement 从 410 响应体提取 "replacement":"<id>"（宽松 JSON 提取，
-// 不依赖完整反序列化成功）。
+// zenExtractReplacement 从 410 响应体提取继任模型 ID（宽松提取，不依赖完整
+// 反序列化成功）。Go 的 encoding/json 字段匹配大小写不敏感，故 "Replacement"
+// 与 "replacement" 都命中；这里额外覆盖 error.details / error.data /
+// metadata 三种嵌套（上游不同错误封装层），并对非 JSON body 做一次保守的
+// 文本回退。仅在调用方已确认为 410 时使用，误判面很窄。
 func zenExtractReplacement(body string) string {
+	type replHolder struct {
+		Replacement string `json:"replacement"`
+	}
 	var probe struct {
 		Replacement string `json:"replacement"`
 		Error       struct {
 			Replacement string `json:"replacement"`
+			Details     replHolder `json:"details"`
+			Data        replHolder `json:"data"`
 		} `json:"error"`
+		Metadata replHolder `json:"metadata"`
 	}
 	if json.Unmarshal([]byte(body), &probe) == nil {
-		if probe.Replacement != "" {
-			return probe.Replacement
+		for _, cand := range []string{
+			probe.Replacement,
+			probe.Error.Replacement,
+			probe.Error.Details.Replacement,
+			probe.Error.Data.Replacement,
+			probe.Metadata.Replacement,
+		} {
+			if cand != "" {
+				return cand
+			}
 		}
-		if probe.Error.Replacement != "" {
-			return probe.Error.Replacement
-		}
+	}
+	// 非 JSON / 半截 JSON 回退：抓 "replacement" 后紧跟的字符串值。
+	if m := reReplacement.FindStringSubmatch(body); m != nil {
+		return m[1]
 	}
 	return ""
 }
+
+// reReplacement 宽松匹配 "replacement"（任意大小写引号形式）后的字符串字面量。
+var reReplacement = regexp.MustCompile(`(?i)["']?replacement["']?\s*[:=]\s*["']([A-Za-z0-9._/-]+)["']`)
 
 // isWrongEndpoint 上游错误是否呈"走错端点"特征。
 // 判定严格基于状态码：

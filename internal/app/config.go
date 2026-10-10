@@ -61,6 +61,8 @@ func envBool(key string) (bool, bool) {
 }
 
 // envInt 解析整数环境变量，无效或未设置返回 (0, false)。
+// 非空但无效时打印警告，与 envBool 一致——静默回退会让配置拼写错误
+// 无从察觉（如并发数误写成 "8s"）。
 func envInt(key string) (int, bool) {
 	v := envStr(key)
 	if v == "" {
@@ -69,6 +71,7 @@ func envInt(key string) (int, bool) {
 	n := 0
 	for _, c := range v {
 		if c < '0' || c > '9' {
+			fmt.Printf("  WARNING: unrecognized integer %q for %s, using default\n", v, key)
 			return 0, false
 		}
 		n = n*10 + int(c-'0')

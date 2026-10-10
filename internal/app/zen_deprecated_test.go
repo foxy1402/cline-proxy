@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // 弃用迁移端到端（httptest 假上游，模式同 zen_learn_confirm_test.go）：
@@ -152,6 +153,51 @@ func TestAliasNeverShadowsRealModel(t *testing.T) {
 	}
 }
 
+// 死亡标记必须有 TTL：目录同步可能长期失败，只靠同步清空会让一个瞬时 400
+// 把模型永久钉死。TTL 过期后标记自动失效（不依赖同步）。
+func TestDeadMarkExpiresByTTL(t *testing.T) {
+	setupZenDepTest(t, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})))
+	zenMarkModelDead("expiring-free")
+	if !zenModelDead("expiring-free") {
+		t.Fatal("freshly marked model must be dead")
+	}
+	// 把标记时间改到 TTL 之前（模拟时间流逝，无需 sleep）
+	zenDepMu.Lock()
+	zenDeadModels["expiring-free"] = time.Now().Add(-(zenDeadTTL + time.Minute)).Unix()
+	zenDepMu.Unlock()
+	if zenModelDead("expiring-free") {
+		t.Fatal("dead mark must expire after the TTL even without a catalog sync")
+	}
+	// 过期即就地删除，不留残留
+	zenDepMu.Lock()
+	_, still := zenDeadModels["expiring-free"]
+	zenDepMu.Unlock()
+	if still {
+		t.Fatal("expired dead mark must be pruned on read")
+	}
+}
+
+// 已有 410 继任别名的 id 即使被 400 标记死亡，也应按别名放行（别名优先），
+// 否则迁移后仍可用的请求会被一条陈旧标记挡住。
+func TestAliasWinsOverDeadMark(t *testing.T) {
+	setupZenDepTest(t, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})))
+	if zenRecordDeprecation("legacy-free", "successor-free") == "" {
+		t.Fatal("record alias")
+	}
+	zenModelsMu.Lock()
+	zenModels["successor-free"] = &ZenModel{ID: "successor-free", Source: "live"}
+	zenModelsMu.Unlock()
+	defer func() {
+		zenModelsMu.Lock()
+		delete(zenModels, "successor-free")
+		zenModelsMu.Unlock()
+	}()
+	zenMarkModelDead("legacy-free")
+	if got := routeModel("legacy-free"); got != "zen" {
+		t.Fatalf("routeModel = %q, want zen (alias must win over a stale dead mark)", got)
+	}
+}
+
 // ===== 测试辅助 =====
 
 func setupZenDepTest(t *testing.T, upstream *httptest.Server) {
@@ -185,23 +231,23 @@ func setupZenDepTest(t *testing.T, upstream *httptest.Server) {
 	zenSessions = map[string]*zenSessionEntry{}
 	zenSessLoaded = true
 	zenSessPath = ""
+	zenSessSaveBlocked = false
 	zenSessMu.Unlock()
 	zenDepMu.Lock()
 	zenDepAliases = map[string]*zenDepEntry{}
 	zenDepLoaded = true
 	zenDepPath = ""
-	zenDeadModels = map[string]bool{}
+	zenDeadModels = map[string]int64{}
 	zenDepMu.Unlock()
 	t.Cleanup(func() {
 		zenDepMu.Lock()
 		zenDepAliases = map[string]*zenDepEntry{}
-		zenDeadModels = map[string]bool{}
+		zenDeadModels = map[string]int64{}
 		zenDepMu.Unlock()
 	})
-	zenRecoverMu.Lock()
-	zenRecoverFails = map[string]int{}
-	zenRecoverLastAt = map[string]int64{}
-	zenRecoverMu.Unlock()
+	zenSessFailedMu.Lock()
+	zenSessFailed = map[string]int{}
+	zenSessFailedMu.Unlock()
 }
 
 func readJSONBody(t *testing.T, r *http.Request, v any) {
@@ -229,4 +275,47 @@ func asZenHTTPError(err error, target **zenHTTPError) bool {
 		return true
 	}
 	return false
+}
+
+// 带前缀/大写变体的 ID 必须解析到同一模型：客户端发 "opencode/big-pickle" 或
+// "Big-Pickle" 时，漏归一化会落空并误路由到 cline 池。
+func TestResolveZenModelNormalizesID(t *testing.T) {
+	zenModelsMu.Lock()
+	savedModels, savedAliases := zenModels, zenAliases
+	zenModels = map[string]*ZenModel{"big-pickle": {ID: "big-pickle", Source: "live"}}
+	zenAliases = map[string]*ZenModel{}
+	zenModelsMu.Unlock()
+	defer func() {
+		zenModelsMu.Lock()
+		zenModels, zenAliases = savedModels, savedAliases
+		zenModelsMu.Unlock()
+	}()
+
+	for _, in := range []string{"big-pickle", "Big-Pickle", "opencode/big-pickle", "opencode/BIG-PICKLE", "  Big-Pickle  "} {
+		m, ok := resolveZenModel(in)
+		if !ok || m.ID != "big-pickle" {
+			t.Errorf("resolveZenModel(%q) = %v,%v; want big-pickle,true", in, m, ok)
+		}
+	}
+	if got := routeModel("opencode/Big-Pickle"); got != "zen" {
+		t.Errorf("routeModel(opencode/Big-Pickle) = %q, want zen", got)
+	}
+}
+
+// dead 标记与 410 别名都以规范 ID 为键：带前缀/大写的查询必须命中。
+func TestDeadMarkAndAliasNormalizeKeys(t *testing.T) {
+	setupZenDepTest(t, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})))
+	zenMarkModelDead("opencode/Some-Model")
+	if !zenModelDead("some-model") {
+		t.Fatal("dead mark recorded with a prefixed/cased id must be findable via the canonical id")
+	}
+	if !zenModelDead("opencode/Some-Model") {
+		t.Fatal("dead mark must also be findable via the original prefixed/cased id")
+	}
+	if repl := zenRecordDeprecation("OpenCode/Old-Free", "New-Free"); repl != "new-free" {
+		t.Fatalf("record returned %q, want normalized new-free", repl)
+	}
+	if got := zenDeprecatedReplacement("old-free"); got != "new-free" {
+		t.Fatalf("alias lookup = %q, want new-free", got)
+	}
 }

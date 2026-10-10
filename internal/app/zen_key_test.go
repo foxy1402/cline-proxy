@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,14 +28,14 @@ func setupZenProbeTest(t *testing.T, handler http.HandlerFunc) {
 	zenKeyMu.Lock()
 	zenKeyCool = map[string]time.Time{}
 	zenKeyMu.Unlock()
-	zenRecoverMu.Lock()
-	zenRecoverFails = map[string]int{}
-	zenRecoverLastAt = map[string]int64{}
-	zenRecoverMu.Unlock()
+	zenSessFailedMu.Lock()
+	zenSessFailed = map[string]int{}
+	zenSessFailedMu.Unlock()
 	zenSessMu.Lock()
 	zenSessions = map[string]*zenSessionEntry{}
 	zenSessLoaded = true
 	zenSessPath = ""
+	zenSessSaveBlocked = false
 	zenSessMu.Unlock()
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
@@ -128,14 +129,20 @@ func TestZenKeyTestProbe429ReportsCooldown(t *testing.T) {
 	}
 }
 
-func TestZenKeyTestProbe403ReportsSessionDeadAndTriggersRefresh(t *testing.T) {
+func TestZenKeyTestProbe403ReportsErrorWithoutStateChange(t *testing.T) {
 	setupZenProbeTest(t, func(w http.ResponseWriter, r *http.Request) {
 		// 纯 FreeTier 403：body 不得含限流关键词（否则 isRateLimited 会把它
-		// 当 429 分支处理，测不到会话死亡路径）
+		// 当 429 分支处理，测不到会话拒绝路径）
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"error":{"type":"free_tier_error","message":"session check failed"}}`))
 	})
 	key := "sk-aaa111"
+	// 先绑一个已知会话，探测后必须原样保留（探测不触碰会话状态）
+	StickyZenIdentity(key)
+	zenSessMu.Lock()
+	before := zenSessions[key].Session
+	zenSessMu.Unlock()
+
 	result, status := testZenKey(key, 0, "")
 	if status != "error" {
 		t.Fatalf("status = %q, want error", status)
@@ -143,24 +150,22 @@ func TestZenKeyTestProbe403ReportsSessionDeadAndTriggersRefresh(t *testing.T) {
 	if got := result["httpStatus"]; got != http.StatusForbidden {
 		t.Fatalf("httpStatus = %v, want 403", got)
 	}
-	// refreshZenSession 是异步触发的（go ...），给它一点时间落账
-	deadline := time.Now().Add(2 * time.Second)
-	fails := 0
-	for {
-		zenRecoverMu.Lock()
-		fails = zenRecoverFails[key]
-		zenRecoverMu.Unlock()
-		if fails == 1 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	// 探测绝不改动生产会话/冷却/失败印记（结论只属于这次点击）
+	zenSessMu.Lock()
+	after := zenSessions[key].Session
+	zenSessMu.Unlock()
+	if after != before {
+		t.Fatalf("probe must not refresh the production session: %s -> %s", before, after)
 	}
-	if fails != 1 {
-		t.Fatalf("403 fail counter = %d, want 1 (probe must trigger the local session refresh)", fails)
+	if zenKeyCooling(key) {
+		t.Fatal("probe 403 must not cool the key")
 	}
-	zenRecoverMu.Lock()
-	delete(zenRecoverFails, key)
-	zenRecoverMu.Unlock()
+	zenSessFailedMu.Lock()
+	_, marked := zenSessFailed[key]
+	zenSessFailedMu.Unlock()
+	if marked {
+		t.Fatal("probe 403 must not mark the production key as failed")
+	}
 }
 
 // pin 语义：429 时绝不换 key、绝不重试——一次探测恰好一次上游调用，且始终是
@@ -265,11 +270,11 @@ func TestZenKeyTestRateLimitShaped403ReportsCooldown(t *testing.T) {
 	if !zenKeyCooling(key) {
 		t.Fatal("keyword-403 probe did not cool the key")
 	}
-	zenRecoverMu.Lock()
-	fails := zenRecoverFails[key]
-	zenRecoverMu.Unlock()
-	if fails != 0 {
-		t.Fatalf("403 fail counter = %d, want 0 (rate-limited 403 must not trigger a session refresh)", fails)
+	zenSessFailedMu.Lock()
+	_, marked := zenSessFailed[key]
+	zenSessFailedMu.Unlock()
+	if marked {
+		t.Fatal("rate-limited 403 must not mark the key as session-failed")
 	}
 	if result["cooldownUntil"] == nil || result["remaining"] == nil {
 		t.Fatalf("cooldown fields missing: %v", result)
@@ -443,5 +448,160 @@ func TestZenKeyTestHonorsExplicitModel(t *testing.T) {
 	}
 	if !strings.Contains(result["reason"].(string), "no-such-model") {
 		t.Fatalf("reason = %v, want it to name the bad model", result["reason"])
+	}
+}
+
+// 新 403 语义（回归）：FreeTier 403 后同一 key 内换新一次会话再重试一次；
+// 第二次仍 403 → 冷却该 key 并快速失败。绝不跨 key 扇出（换 key 只会把坏
+// 状态扩散到全池）。
+func TestZenCall403RefreshesSameKeyOnceThenCoolsAndFails(t *testing.T) {
+	var hits int32
+	seen := map[string]int{}
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		k := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		seen[k]++
+		mu.Unlock()
+		// 恒定 FreeTier 403，body 不含限流关键词
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"type":"free_tier_error","message":"session check failed"}}`))
+	}))
+	defer upstream.Close()
+
+	savedCfg := getZenConfig()
+	cfgCopy := *savedCfg
+	cfgCopy.Enabled = true
+	cfgCopy.BaseURL = upstream.URL
+	cfgCopy.Keys = []string{"sk-one", "sk-two", "sk-three"}
+	cfgCopy.Proxies = nil
+	cfgCopy.Retries = 3
+	setZenConfig(&cfgCopy)
+	t.Cleanup(func() { setZenConfig(savedCfg) })
+	setZenModelForTest("aaa-probe-model", "")
+	t.Cleanup(func() {
+		zenKeyMu.Lock()
+		zenKeyCool = map[string]time.Time{}
+		zenKeyMu.Unlock()
+		zenSessFailedMu.Lock()
+		zenSessFailed = map[string]int{}
+		zenSessFailedMu.Unlock()
+	})
+
+	params := map[string]any{
+		"model":      "aaa-probe-model",
+		"messages":   []any{map[string]any{"role": "user", "content": "x"}},
+		"max_tokens": 64,
+	}
+	_, _, err := callZenAPI(t.Context(), params, true)
+	var he *zenHTTPError
+	if !errors.As(err, &he) || he.Status != http.StatusForbidden {
+		t.Fatalf("err = %v, want zenHTTPError 403", err)
+	}
+	// 恰好 2 次上游调用：原始 403 + 换新后同 key 重试仍 403
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (original + one same-key retry, no fan-out)", n)
+	}
+	// 且两次都在同一个 key 上
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 1 {
+		t.Fatalf("403 must not fan out across keys, saw keys %v", seen)
+	}
+	for k, n := range seen {
+		if n != 2 {
+			t.Fatalf("key %q used %d times, want 2", k, n)
+		}
+		if !zenKeyCooling(k) {
+			t.Fatalf("key %q must be cooled after a double 403", k)
+		}
+	}
+}
+
+// responses 路径的同一 403 语义：同 key 换新一次会话后重试一次，再 403 即冷却
+// 失败，绝不跨 key 扇出。
+func TestZenResponses403RefreshesSameKeyOnceThenCoolsAndFails(t *testing.T) {
+	var hits int32
+	seen := map[string]int{}
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		k := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		seen[k]++
+		mu.Unlock()
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"type":"free_tier_error","message":"session check failed"}}`))
+	}))
+	defer upstream.Close()
+
+	savedCfg := getZenConfig()
+	cfgCopy := *savedCfg
+	cfgCopy.Enabled = true
+	cfgCopy.BaseURL = upstream.URL
+	cfgCopy.Keys = []string{"sk-one", "sk-two", "sk-three"}
+	cfgCopy.Proxies = nil
+	cfgCopy.Retries = 3
+	setZenConfig(&cfgCopy)
+	t.Cleanup(func() { setZenConfig(savedCfg) })
+	setZenModelForTest("resp-model", "responses") // 走原生 responses 路径
+	t.Cleanup(func() {
+		zenKeyMu.Lock()
+		zenKeyCool = map[string]time.Time{}
+		zenKeyMu.Unlock()
+		zenSessFailedMu.Lock()
+		zenSessFailed = map[string]int{}
+		zenSessFailedMu.Unlock()
+	})
+
+	params := map[string]any{
+		"model":      "resp-model",
+		"messages":   []any{map[string]any{"role": "user", "content": "x"}},
+		"max_tokens": 64,
+	}
+	_, _, err := callZenResponsesAPI(t.Context(), params, true)
+	var he *zenHTTPError
+	if !errors.As(err, &he) || he.Status != http.StatusForbidden {
+		t.Fatalf("err = %v, want zenHTTPError 403", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (original + one same-key retry)", n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 1 {
+		t.Fatalf("responses 403 must not fan out across keys, saw %v", seen)
+	}
+	for k := range seen {
+		if !zenKeyCooling(k) {
+			t.Fatalf("key %q must be cooled after a double 403", k)
+		}
+	}
+}
+
+// setZenGateHeaders 契约：两条 zen 上游路径共用的身份头必须齐全，且
+// session 头两处同值、request 头独立。上游按这些头做 CLI 指纹判定，
+// 少一个就可能被判非 CLI 流量而 403。
+// 直接读 raw map（不用 Header.Get）：本函数刻意用小写头名以字节级对齐官方
+// CLI，而 Get 会规范化键名，读不到小写条目。
+func TestSetZenGateHeadersContract(t *testing.T) {
+	req, err := http.NewRequest("POST", "http://example.invalid/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setZenGateHeaders(req, "ses_abc123", "msg_xyz789")
+	want := map[string]string{
+		"x-opencode-session-id": "ses_abc123",
+		"x-opencode-session":    "ses_abc123",
+		"x-opencode-request":    "msg_xyz789",
+		"x-opencode-client":     "cli",
+		"x-opencode-project":    "global",
+	}
+	for k, v := range want {
+		vals := req.Header[k]
+		if len(vals) != 1 || vals[0] != v {
+			t.Errorf("raw header %q = %v, want [%q]", k, vals, v)
+		}
 	}
 }

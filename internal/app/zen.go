@@ -85,12 +85,20 @@ func initZenModels() {
 	}
 }
 
-// resolveZenModel 解析模型名到 zen 模型。支持 "opencode/<id>" 前缀与别名。
+// normalizeZenModelID 规范化 zen 模型 ID 用于表查找：trim + 小写 + 去掉
+// "opencode/" 前缀。zen 模型 ID（种子与官方目录 id）均为小写；客户端可能发
+// "Big-Pickle" 或 "opencode/big-pickle"，不规范化的查找会落空，进而把请求
+// 错误路由到 cline 池（或让 dead/alias 标记不可达）。
+func normalizeZenModelID(id string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(id)), "opencode/")
+}
+
+// resolveZenModel 解析模型名到 zen 模型。支持 "opencode/<id>" 前缀与别名（大小写不敏感）。
 // 别名优先: 同步来的付费同名模型(如 deepseek-v4-flash)不会覆盖 free 别名解析。
 // 410 迁移别名是最后兜底：原始 ID 不存在时返回继任模型（真实模型永远优先，
 // 继任者上线不会被弃用别名遮蔽）。
 func resolveZenModel(id string) (*ZenModel, bool) {
-	id = strings.TrimSpace(id)
+	id = normalizeZenModelID(id)
 	if id == "" {
 		return nil, false
 	}
@@ -98,17 +106,6 @@ func resolveZenModel(id string) (*ZenModel, bool) {
 	if m, ok := zenAliases[id]; ok {
 		zenModelsMu.RUnlock()
 		return m, true
-	}
-	if strings.HasPrefix(id, "opencode/") {
-		short := strings.TrimPrefix(id, "opencode/")
-		if m, ok := zenAliases[short]; ok {
-			zenModelsMu.RUnlock()
-			return m, true
-		}
-		if m, ok := zenModels[short]; ok {
-			zenModelsMu.RUnlock()
-			return m, true
-		}
 	}
 	if m, ok := zenModels[id]; ok {
 		zenModelsMu.RUnlock()
@@ -122,12 +119,13 @@ func resolveZenModel(id string) (*ZenModel, bool) {
 }
 
 // isZenFreeModel 免费判定: seed 白名单、live 同步（已过价格门）、
-// registry/synced 或通用的 -free 后缀。big-pickle/union-alpha 无 free 后缀，
+// learned（学习器改过端点但仍是同一批已入选免费模型）、或通用的 -free 后缀。
+// big-pickle/union-alpha 无 free 后缀，靠 Source=="live"/"learned" 入选。
 func isZenFreeModel(m *ZenModel) bool {
 	if m == nil {
 		return false
 	}
-	if m.Source == "seed" || m.Source == "live" {
+	if m.Source == "seed" || m.Source == "live" || m.Source == "learned" {
 		return true
 	}
 	return strings.HasSuffix(m.ID, "-free")
@@ -151,7 +149,7 @@ func zenProbeModel() *ZenModel {
 	}
 	var best *ZenModel
 	for _, m := range zenModels {
-		if !isZenFreeModel(m) || m.Source != "live" {
+		if !isZenFreeModel(m) || (m.Source != "live" && m.Source != "learned") {
 			continue
 		}
 		if best == nil || m.ID < best.ID {
@@ -191,24 +189,30 @@ func routeModel(id string) string {
 	if c := resolveCombo(id); c != nil {
 		return c.Platform
 	}
+	// zen 表查找统一用小写去前缀的规范 ID：dead 标记与 410 别名都以规范 ID
+	// 为键，客户端发 "Big-Pickle" / "opencode/big-pickle" 时不做归一就查不到，
+	// 请求会误落到 cline 池（或让标记形同虚设）。
+	zenID := normalizeZenModelID(id)
 	initZenModels()
 	cfg := getZenConfig()
 	// 上游 400 "Model is unavailable" 的死亡标记：直接拒绝，不再每次请求
-	// 都白烧一个上游往返。下次目录同步成功后自动解除。
-	if zenModelDead(id) {
-		log.Printf("  route: %q marked unavailable by upstream, rejecting until next catalog sync", id)
+	// 都白烧一个上游往返。下次目录同步成功（或 TTL 过期）后自动解除。
+	// 例外：该 id 若已有 410 继任别名，别名优先——迁移后请求仍有真实去处，
+	// 不该被一条陈旧的 400 标记挡住。
+	if zenModelDead(zenID) && zenDeprecatedReplacement(zenID) == "" {
+		log.Printf("  route: %q marked unavailable by upstream, rejecting until next catalog sync", zenID)
 		return "reject"
 	}
-	if zm, ok := resolveZenModel(id); ok {
+	if zm, ok := resolveZenModel(zenID); ok {
 		if isZenFreeModel(zm) {
 			// 与 cline 模型表冲突时(几乎不可能)走 cline
 			initModelsCache()
 			modelsMu.Lock()
-			_, inCline := modelsCache[id]
+			_, inCline := modelsCache[zenID]
 			modelsMu.Unlock()
 			if !inCline {
 				if cfg.Failover && zenFailedNow() {
-					log.Printf("  failover: zen degraded, %q routed to cline pool", id)
+					log.Printf("  failover: zen degraded, %q routed to cline pool", zenID)
 					return "cline"
 				}
 				return "zen"
@@ -335,14 +339,19 @@ func zenFailedNow() bool {
 	return true
 }
 
-// isRateLimited 限流信号识别: 429/503 直接命中; 502/403 按错误体关键词
+// isRateLimited 限流信号识别: 429/503 直接命中; 502/403 按错误体关键词。
+// 关键词含配额耗尽类措辞——它们与限流同样应触发冷却/换 key，而不是当作
+// 普通错误立刻回给客户端。
 func isRateLimited(status int, body string) bool {
 	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
 		return true
 	}
 	if status == http.StatusBadGateway || status == http.StatusForbidden {
 		low := strings.ToLower(body)
-		for _, kw := range []string{"resourceexhausted", "limit reached", "rate limit", "too many", "overloaded", "busy"} {
+		for _, kw := range []string{
+			"resourceexhausted", "limit reached", "rate limit", "too many", "overloaded", "busy",
+			"quota", "exceeded", "insufficient",
+		} {
 			if strings.Contains(low, kw) {
 				return true
 			}
@@ -1063,6 +1072,19 @@ func buildZenResponsesBody(params map[string]any, modelID string, promptKey stri
 	return body
 }
 
+// setZenGateHeaders 写入 zen 免费门要求的客户端身份头，两条上游路径（chat
+// /responses）共用——此前两处逐行重复，改一处漏一处就会让某条路径掉头。
+// 直接写 map（而非 Header.Set）以保留小写头名：官方 CLI 发的就是小写，
+// Set 会规范化为 X-Opencode-...；HTTP 头大小写不敏感，但字节级对齐更安全。
+// Authorization/Content-Type/User-Agent 因需承载变量，由调用方先行设置。
+func setZenGateHeaders(req *http.Request, sess, requestID string) {
+	req.Header["x-opencode-session-id"] = []string{sess}
+	req.Header["x-opencode-session"] = []string{sess}
+	req.Header["x-opencode-request"] = []string{requestID}
+	req.Header["x-opencode-client"] = []string{"cli"}
+	req.Header["x-opencode-project"] = []string{"global"}
+}
+
 // zenClientFlatTools 提取客户端工具并转成 responses 端点要求的 flat 形态。
 // 同时接受 chat 嵌套形态 {type,function:{...}} 与 responses 原生 flat 形态
 // {type,name,description,parameters,strict}。
@@ -1600,8 +1622,9 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 	}
 	delay := time.Second
 	rateLimited := 0
-	retryKey := ""    // 非空时重试沿用该 key（保持 key sess_ 一致）
-	remapped := false // 410 弃用迁移至多一次，防别名链循环
+	retryKey := ""       // 非空时重试沿用该 key（保持 key sess_ 一致）
+	remapped := false    // 410 弃用迁移至多一次，防别名链循环
+	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
 
 	for attempt := 0; ; attempt++ {
 		proxyURL, pidx := pickUpstreamProxy()
@@ -1648,11 +1671,7 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 		req.Header.Set("User-Agent", ua)
 		// x-opencode-session-id：真实 CLI 两个头都发（request.ts）；对本仓库的
 		// 格式门结论无害，补上只为字节级对齐官方流量。
-		req.Header.Set("x-opencode-session-id", sess)
-		req.Header.Set("x-opencode-session", sess)
-		req.Header.Set("x-opencode-request", user)
-		req.Header.Set("x-opencode-client", "cli")
-		req.Header.Set("x-opencode-project", "global")
+		setZenGateHeaders(req, sess, user)
 		log.Printf("  zen upstream: model=%s responses stream=%v via=%s key=#%d attempt=%d session=%s",
 			zm.ID, stream, viaProxy, keyIndex(key), attempt+1, kit.Truncate(sess, 24))
 
@@ -1756,24 +1775,29 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 		if resp.StatusCode >= 500 && o.pinKey == "" {
 			markZenFail()
 		}
-		// 会话失效（FreeTier 403 且非限流）：该 key 的 sess_ 已被上游拒绝，
-		// 复用只会持续 403。后台本地换新（连续 403 达阈值，零成本零子进程）。
-		// 本次按轮转换 key 重试。
+		// 会话失效（FreeTier 403 且非限流）：403 针对 key/会话，换到别的 key 只会
+		// 把同一批坏状态扩散到全池，绕过不了它。正确做法是同一 key 上同步换一次
+		// 会话再重试一次（sessionRetried 保证本请求至多一次）；仍 403 则该 key
+		// 确实不可用——短暂冷却并快速失败，不再跨 key 扇出。
 		if resp.StatusCode == http.StatusForbidden {
-			go refreshZenSession(key)
-			// pinKey（面板 Test）：会话已死的结论立刻上报（本地换新已在后台
-			// 触发），同 key 重试只会再 403，换 key 则测的不是它。
+			// pinKey（面板 Test）：探测结论只属于这次点击，绝不触碰会话状态、
+			// 不冷却、不重试——同 key 立刻原样上报。
 			if o.pinKey != "" {
 				return nil, rateLimited, apiErr
 			}
-			if attempt < retries {
-				if next := pickZenKey(); next != "" && !zenKeyCooling(next) {
-					key = next
-					retryKey = next
-					log.Printf("  zen responses session rejected (403) [%s], switching to key#%d", zenSessionDesc(key), keyIndex(next))
-					continue
-				}
+			if !sessionRetried {
+				sessionRetried = true
+				log.Printf("  zen responses session rejected (403) [%s] key#%d: refreshing session locally, retry same key",
+					zenSessionDesc(key), keyIndex(key))
+				refreshZenSession(key)
+				continue
 			}
+			// 换新后仍 403：该 key 不可用，冷却 5 分钟后快速失败。
+			zenSessionFailed(key)
+			applied := cooldownZenKey(key, 5*time.Minute)
+			log.Printf("  zen responses session rejected twice (403) key#%d: key cooled %v, failing fast (no cross-key fan-out)",
+				keyIndex(key), applied)
+			return nil, rateLimited, apiErr
 		}
 		// 弃用迁移（410 + replacement / 400 unavailable）：非 pin 探测才迁移——
 		// 探测的结论只属于这次点击，不得改写共享状态。
@@ -1836,7 +1860,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 	}
 	delay := time.Second
 	rateLimited := 0
-	remapped := false // 410 弃用迁移至多一次，防别名链循环
+	remapped := false       // 410 弃用迁移至多一次，防别名链循环
+	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
 
 	for attempt := 0; ; attempt++ {
 		// 代理轮转（round_robin 默认）: 每次上游尝试显式挑选出口,
@@ -1870,11 +1895,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", ua)
 		// x-opencode-session-id：真实 CLI 两个头都发（request.ts），见 responses 路径。
-		req.Header.Set("x-opencode-session-id", sess)
-		req.Header.Set("x-opencode-session", sess)
-		req.Header.Set("x-opencode-request", user)
-		req.Header.Set("x-opencode-client", "cli")
-		req.Header.Set("x-opencode-project", "global")
+		setZenGateHeaders(req, sess, user)
 
 		log.Printf("  zen upstream: model=%s stream=%v msgs=%d via=%s key=#%d attempt=%d session=%s",
 			body["model"], stream, getMsgCount(params), viaProxy, keyIndex(key), attempt+1, kit.Truncate(sess, 24))
@@ -1965,21 +1986,29 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 		if resp.StatusCode >= 500 && o.pinKey == "" {
 			markZenFail()
 		}
-		// 会话失效（FreeTier 403 且非限流）：该 key 的 sess_ 已被上游拒绝，
-		// 复用只会持续 403。后台本地换新（连续 403 达阈值）；本次直接轮转
-		// 下一 key 重试（循环头每次 pickZenKey，天然换 key）。
+		// 会话失效（FreeTier 403 且非限流）：403 针对 key/会话，换到别的 key 只会
+		// 把坏状态扩散到全池。同一 key 上同步换一次会话再重试一次（sessionRetried
+		// 保证至多一次）；仍 403 则冷却该 key 并快速失败，不再跨 key 扇出。
 		if resp.StatusCode == http.StatusForbidden {
 			// 记录会话年龄：合法格式会话 403 是"会话寿命/额度窗口到期或
 			// 门禁收紧"的证据；换新频率升高即是 tripwire。
-			log.Printf("  zen chat session rejected (403) [%s], key#%d", zenSessionDesc(key), keyIndex(key))
-			go refreshZenSession(key)
-			// pinKey（面板 Test）：立即上报（换新已在后台触发），见 responses 路径同处。
+			// pinKey（面板 Test）：探测结论只属于这次点击，不触碰会话状态。
 			if o.pinKey != "" {
+				log.Printf("  zen chat session rejected (403) [%s], key#%d (probe: no state change)", zenSessionDesc(key), keyIndex(key))
 				return nil, rateLimited, apiErr
 			}
-			if attempt < retries {
+			if !sessionRetried {
+				sessionRetried = true
+				log.Printf("  zen chat session rejected (403) [%s] key#%d: refreshing session locally, retry same key",
+					zenSessionDesc(key), keyIndex(key))
+				refreshZenSession(key)
 				continue
 			}
+			zenSessionFailed(key)
+			applied := cooldownZenKey(key, 5*time.Minute)
+			log.Printf("  zen chat session rejected twice (403) key#%d: key cooled %v, failing fast (no cross-key fan-out)",
+				keyIndex(key), applied)
+			return nil, rateLimited, apiErr
 		}
 		// 弃用迁移（410 + replacement / 400 unavailable）：非 pin 探测才迁移；
 		// 迁移成功则重建 body 就地重试（至多一次）。
@@ -2074,6 +2103,10 @@ func zenModelList() []map[string]any {
 // 测试用 zenRegistryURL 覆写指向 httptest 服务。
 const opencodeModelsRegistry = "https://models.opencode.ai/api.json"
 
+// maxRegistryBytes 目录响应体积上限（8 MiB）。正常目录约几百 KB，设置上限
+// 只为防止异常响应把内存吃穿；超限按"不可达"处理。
+const maxRegistryBytes = 8 << 20
+
 var zenRegistryURL = opencodeModelsRegistry
 
 // zenModelOverlay 公共目录里比 zen 真源多的限额/旗标字段。
@@ -2126,13 +2159,17 @@ func fetchZenRegistry() (map[string]zenModelOverlay, map[string]bool, bool) {
 				Context int `json:"context"`
 				Output  int `json:"output"`
 			} `json:"limit"`
-			Cost struct {
+			// Cost 用指针以区分"cost 键缺失"与"cost 全为 0"：缺失时不能当作
+			// 免费（fail-closed），否则目录漏填价格字段的模型会被误判入免费池。
+			Cost *struct {
 				Input  float64 `json:"input"`
 				Output float64 `json:"output"`
 			} `json:"cost"`
 		} `json:"models"`
 	}
-	if json.NewDecoder(oresp.Body).Decode(&payload) != nil {
+	// 体积上限：目录正常约几百 KB，恶意/异常响应不应无界读入内存。
+	// 超限即视为不可达（fail-open 的调用方保留上次目录）。
+	if json.NewDecoder(io.LimitReader(oresp.Body, maxRegistryBytes+1)).Decode(&payload) != nil {
 		return overlay, freeGate, false
 	}
 	prov, ok := payload["opencode"]
@@ -2160,7 +2197,7 @@ func fetchZenRegistry() (map[string]zenModelOverlay, map[string]bool, bool) {
 			ToolCall: m.ToolCall, Reasoning: m.Reasoning, Attachment: m.Attachment,
 			NPM: npm,
 		}
-		if m.Cost.Input == 0 && m.Cost.Output == 0 &&
+		if m.Cost != nil && m.Cost.Input == 0 && m.Cost.Output == 0 &&
 			!strings.Contains(strings.ToLower(m.Status), "deprecat") {
 			freeGate[id] = true
 		}
@@ -2278,7 +2315,14 @@ func applyZenCatalog(desired map[string]bool, overlay map[string]zenModelOverlay
 					next.Upstream = up
 				}
 			}
-			next.Source = "live"
+			// Source 保留"learned"标记：它既表示"学习器已定论，npm 不得重播种"，
+			// 也是 saveZenEndpoints 写盘时的筛选条件（只存 learned 条目）。这里若
+			// 无条件抹成 "live"，sync 结束前并发的 saveZenEndpoints 会把该条目从
+			// 学习文件里丢掉，reapplyLearnedEndpoints 也因此失去依据——学习决策
+			// 只在 reapply 恰好晚于本函数的时序下才存活。保留标记使契约显式成立。
+			if next.Source != "learned" {
+				next.Source = "live"
+			}
 			zenModels[id] = &next
 			continue
 		}

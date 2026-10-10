@@ -180,6 +180,39 @@ func responsesToolsToChat(tools []any) []any {
 
 // ============ 非流式响应转换 ============
 
+// chatAsSSEResponse 把一个已聚合的 chat completion 结果包成单事件的 chat SSE
+// 响应体，供 chatStreamToResponses 复用（原生 responses 模型在 /v1/responses
+// 入口需先聚合再按流式重放，避免另写一套 responses 事件生成）。
+func chatAsSSEResponse(chat map[string]any) *http.Response {
+	model, _ := chat["model"].(string)
+	msg, _ := getNested(chat, "choices", 0, "message").(map[string]any)
+	if msg == nil {
+		msg = map[string]any{}
+	}
+	finish, _ := getNested(chat, "choices", 0, "finish_reason").(string)
+	chunk := map[string]any{
+		"id":      fmt.Sprintf("chatcmpl-%x", time.Now().UnixNano()),
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         msg,
+			"finish_reason": finish,
+		}},
+	}
+	if u, ok := chat["usage"]; ok {
+		chunk["usage"] = u
+	}
+	data, _ := json.Marshal(chunk)
+	body := "data: " + string(data) + "\n\ndata: [DONE]\n\n"
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
 // chatToResponses chat.completions 响应 -> Responses 响应
 func chatToResponses(chat map[string]any) map[string]any {
 	resp := map[string]any{
@@ -603,7 +636,9 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 
 func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"error": map[string]string{"message": "method not allowed", "type": "invalid_request_error"},
+		})
 		return
 	}
 	body, err := io.ReadAll(r.Body)
@@ -659,6 +694,44 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		out := maybeCompact(chat, zm, sid)
 		if out.changed {
 			log.Printf("  responses zen: %s", out.note)
+		}
+		// 原生 responses 端点模型（muse-spark 等）：上游只认 /responses 协议，
+		// 走 chat/completions 会被 400 ModelProtocolUnsupported。此前本入口无条件
+		// 调 callZenAPI（chat 端点），这类模型在 /v1/responses 上 100% 失败。
+		// 与 chat 入口一致：上游恒 stream=true，先聚合原生 SSE 成 chat 形态，
+		// 再用既有的 chat→responses 转换（流式经 chatStreamToResponses 重放）。
+		if zm.Upstream == "responses" {
+			nresp, _, rerr := callZenResponsesAPI(r.Context(), chat, true)
+			if rerr != nil {
+				log.Printf("  responses zen native api error: %v", rerr)
+				writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error": map[string]string{"message": rerr.Error(), "type": "api_error"},
+				})
+				return
+			}
+			agg, aerr := responsesSSEToChat(nresp)
+			if aerr != nil {
+				log.Printf("  responses zen native aggregate error: %v", aerr)
+				writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error": map[string]string{"message": aerr.Error(), "type": "api_error"},
+				})
+				return
+			}
+			agg["model"] = zm.ID
+			if isStream {
+				// 复用 chat SSE→responses 转换：把聚合结果包成一条 chat SSE 流喂进去。
+				// 原生流此前已完整读出，这里不再有增量；对客户端仍按 responses
+				// 事件序列下发（文本/推理/工具调用/usage 均经既有转换路径）。
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.Header().Set("Connection", "keep-alive")
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.WriteHeader(http.StatusOK)
+				chatStreamToResponses(w, chatAsSSEResponse(agg), nil)
+				return
+			}
+			writeJSON(w, http.StatusOK, chatToResponses(normalizeOpenAIResponse(agg)))
+			return
 		}
 		// 上游恒 stream=true：zen 免费层 chat 端点只接受 CLI 形态的流式请求，
 		// stream=false 会被 FreeTier gate 直接 403。非流式客户端在这里把 SSE

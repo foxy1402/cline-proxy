@@ -941,15 +941,15 @@ func defaultProxyConfig() *proxyConfigData {
 	return &proxyConfigData{
 		Strategy: "round_robin",
 		Headers: map[string]string{
-			"User-Agent":         "Cline/3.0.50",
+			"User-Agent":         "Cline/" + clineClientVersion,
 			"HTTP-Referer":       "https://cline.bot",
 			"X-Title":            "Cline",
 			"X-IS-MULTIROOT":     "false",
 			"X-CLIENT-TYPE":      "cline-cli",
-			"X-CLIENT-VERSION":   "3.0.50",
-			"X-PLATFORM":         "terminal",
-			"X-PLATFORM-VERSION": "3.0.50",
-			"X-CORE-VERSION":     "0.0.70",
+			"X-CLIENT-VERSION":   clineClientVersion,
+			"X-PLATFORM":         "cli",
+			"X-PLATFORM-VERSION": clineClientVersion,
+			"X-CORE-VERSION":     clineCoreVersion,
 		},
 	}
 }

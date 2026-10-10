@@ -389,6 +389,58 @@ func pickAccount() *Account {
 	return acc
 }
 
+// pickAccountExcluding 取一个 active 账号,跳过 exclude 中的账号 ID（并跳过
+// 无凭证账号）。供 callClineAPI 的跨账号 failover 使用: 429/5xx 后换一个
+// 不同的账号重试,而不是把整个请求判死。
+func pickAccountExcluding(exclude map[string]bool) *Account {
+	p := loadPool()
+	poolMu.Lock()
+
+	active := make([]*Account, 0, len(p.Accounts))
+	for _, a := range p.Accounts {
+		if a.Status == "cooldown" && !a.CooldownUntil.IsZero() && time.Now().After(a.CooldownUntil) {
+			a.Status = "active"
+			a.CooldownUntil = time.Time{}
+			a.LastReason = ""
+		}
+		if a.Status != "active" {
+			continue
+		}
+		if exclude[a.AccountID] {
+			continue
+		}
+		if a.APIToken == "" && a.RefreshToken == "" {
+			continue
+		}
+		active = append(active, a)
+	}
+
+	if len(active) == 0 {
+		poolMu.Unlock()
+		return nil
+	}
+
+	cfg := getProxyConfig()
+	var acc *Account
+	switch cfg.Strategy {
+	case "fill":
+		acc = active[0]
+	case "random":
+		n := time.Now().UnixNano() % int64(len(active))
+		acc = active[n]
+	default: // round_robin
+		if p.CurrentIdx >= len(active) {
+			p.CurrentIdx = 0
+		}
+		acc = active[p.CurrentIdx]
+		p.CurrentIdx = (p.CurrentIdx + 1) % len(active)
+	}
+
+	markPoolDirtyLocked()
+	poolMu.Unlock()
+	return acc
+}
+
 // pickAccountAny 取任意一个仍持有凭证的账号（含冷却中的），供与推理配额
 // 无关的只读调用使用（如 /ai/cline/recommended-models 免费模型列表）。
 // 推理额度耗尽（429→cooldown）不影响这类接口：实测 4 个账号全部 429 时

@@ -81,3 +81,24 @@ func TestValidZenSessionID(t *testing.T) {
 		}
 	}
 }
+
+// 匿名路径的身份也必须过免费门：session 组件必须是合法 ses_ 格式，
+// 否则路由到 zen 时每请求必 403（旧实现 mint "sess_"+26 随机串即此问题）。
+func TestFreshZenIdentityMintsValidSession(t *testing.T) {
+	re := regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+	for i := 0; i < 50; i++ {
+		sess, req, ua := FreshZenIdentity()
+		if !re.MatchString(sess) {
+			t.Fatalf("anonymous session not gate-valid: %q", sess)
+		}
+		if !ValidZenSessionID(sess) {
+			t.Fatalf("ValidZenSessionID rejected a freshly minted session: %q", sess)
+		}
+		if !strings.HasPrefix(req, "msg_") || len(req) != 30 {
+			t.Fatalf("request id malformed: %q", req)
+		}
+		if ua == "" {
+			t.Fatal("user-agent must not be empty")
+		}
+	}
+}

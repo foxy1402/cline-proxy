@@ -9,7 +9,7 @@ import (
 	"cline-go-proxy/internal/kit"
 )
 
-// 隔离测试环境：独立 DATA_DIR，并清空进程级会话/恢复计数状态。
+// 隔离测试环境：独立 DATA_DIR，并清空进程级会话/失败印记状态。
 func setupZenSessionTest(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "zen-session-test")
@@ -23,11 +23,11 @@ func setupZenSessionTest(t *testing.T) string {
 	zenSessions = map[string]*zenSessionEntry{}
 	zenSessLoaded = true
 	zenSessPath = ""
+	zenSessSaveBlocked = false
 	zenSessMu.Unlock()
-	zenRecoverMu.Lock()
-	zenRecoverFails = map[string]int{}
-	zenRecoverLastAt = map[string]int64{}
-	zenRecoverMu.Unlock()
+	zenSessFailedMu.Lock()
+	zenSessFailed = map[string]int{}
+	zenSessFailedMu.Unlock()
 	return dir
 }
 
@@ -145,85 +145,113 @@ func TestZenSessionDescReportsAge(t *testing.T) {
 	}
 }
 
-// refreshZenSession：连续 2 次 403 才换新会话；1 分钟退避内的重复触发不动作。
-func TestRefreshZenSessionThresholdAndBackoff(t *testing.T) {
+// refreshZenSession：每次调用同步换新（幂等、零成本）；空 key / public 不动；
+// 已从配置移除的 key 不重建（防止 prune 后又被复活）。
+func TestRefreshZenSessionMintsFreshSession(t *testing.T) {
 	setupZenSessionTest(t)
 	key := "sk-refresh"
+	cfg := getZenConfig()
+	cfg2 := *cfg
+	cfg2.Keys = []string{key}
+	setZenConfig(&cfg2)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
 
-	refreshZenSession(key) // 第 1 次：未达阈值
+	StickyZenIdentity(key)
 	zenSessMu.Lock()
-	if _, ok := zenSessions[key]; ok {
-		t.Fatal("single 403 must not refresh")
-	}
+	before := zenSessions[key].Session
 	zenSessMu.Unlock()
 
-	refreshZenSession(key) // 第 2 次：达阈值，铸造新会话
-	zenSessMu.Lock()
-	e := zenSessions[key]
-	zenSessMu.Unlock()
-	if e == nil || !zenSessionLive(key) {
-		t.Fatal("two consecutive 403s must mint a fresh session")
-	}
-	first := e.Session
-
-	// 退避窗口内再来两次 403：不换新（会话保持不变）
-	refreshZenSession(key)
 	refreshZenSession(key)
 	zenSessMu.Lock()
 	after := zenSessions[key].Session
 	zenSessMu.Unlock()
-	if after != first {
-		t.Fatalf("refresh happened inside the backoff window: %s -> %s", first, after)
+	if after == before {
+		t.Fatal("refreshZenSession must mint a new session id")
 	}
-
-	// 把上次换新时间拨回 2 分钟前：下一轮 403 立即换新
-	zenRecoverMu.Lock()
-	zenRecoverLastAt[key] = time.Now().Add(-2 * time.Minute).Unix()
-	zenRecoverMu.Unlock()
+	if !zenSessionLive(key) {
+		t.Fatal("refreshed session must be format-valid/live")
+	}
+	// 再换一次也必须得到新身份（同步、无退避门槛）
 	refreshZenSession(key)
 	zenSessMu.Lock()
-	after = zenSessions[key].Session
+	third := zenSessions[key].Session
 	zenSessMu.Unlock()
-	if after == first {
-		t.Fatal("refresh due after backoff must mint a new session")
+	if third == after {
+		t.Fatal("second refresh must mint another new session id")
+	}
+	// 哨兵与空 key 不动作
+	refreshZenSession("")
+	refreshZenSession("public")
+}
+
+// refreshZenSession 不重建已移除的 key：prune 之后该 key 的条目必须保持消失，
+// 否则 .zen-sessions.json 会被删掉的旧 key 单调撑大。
+func TestRefreshZenSessionSkipsUnconfiguredKey(t *testing.T) {
+	setupZenSessionTest(t)
+	key := "sk-removed-refresh"
+	cfg := getZenConfig()
+	cfg2 := *cfg
+	cfg2.Keys = []string{"sk-only-active"}
+	setZenConfig(&cfg2)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
+
+	refreshZenSession(key)
+	zenSessMu.Lock()
+	_, exists := zenSessions[key]
+	zenSessMu.Unlock()
+	if exists {
+		t.Fatal("refreshZenSession must not re-create an entry for a key absent from the config")
 	}
 }
 
-// zenSessionMarkSuccess 清零连续 403 计数：一次成功就把阈值重新数起。
-func TestZenSessionMarkSuccessResetsFailCounter(t *testing.T) {
+// zenSessionMarkSuccess 清除失败印记：一次成功即该 key 恢复干净。
+func TestZenSessionMarkSuccessClearsFailureMark(t *testing.T) {
 	setupZenSessionTest(t)
 	key := "sk-success"
-	refreshZenSession(key) // 计数 = 1
+	zenSessionFailed(key)
+	zenSessFailedMu.Lock()
+	n := zenSessFailed[key]
+	zenSessFailedMu.Unlock()
+	if n == 0 {
+		t.Fatal("failure mark must be recorded")
+	}
 	zenSessionMarkSuccess(key)
-	refreshZenSession(key) // 若未清零，这里是第 2 次 → 会触发换新
-	zenSessMu.Lock()
-	_, ok := zenSessions[key]
-	zenSessMu.Unlock()
-	if ok {
-		t.Fatal("success must reset the 403 counter; a refresh was wrongly triggered")
+	zenSessFailedMu.Lock()
+	_, still := zenSessFailed[key]
+	zenSessFailedMu.Unlock()
+	if still {
+		t.Fatal("success must clear the failure mark")
 	}
 }
 
-// 配置移除 key 后 prune 会话与恢复计数。
-func TestPruneRemovesSessionsAndRecoverCounters(t *testing.T) {
+// 配置移除 key 后 prune 会话与失败印记。
+func TestPruneRemovesSessionsAndFailureMarks(t *testing.T) {
 	setupZenSessionTest(t)
 	k := "sk-removed"
 	StickyZenIdentity(k)
-	zenRecoverMu.Lock()
-	zenRecoverFails[k] = 1
-	zenRecoverMu.Unlock()
+	zenSessionFailed(k)
 
 	pruneZenKeyState(map[string]bool{})
 
 	if zenSessionLive(k) {
 		t.Fatal("session of a removed key must be pruned")
 	}
-	zenRecoverMu.Lock()
-	_, fails := zenRecoverFails[k]
-	_, lastAt := zenRecoverLastAt[k]
-	zenRecoverMu.Unlock()
-	if fails || lastAt {
-		t.Fatalf("recover counters not pruned: fails=%v lastAt=%v", fails, lastAt)
+	zenSessFailedMu.Lock()
+	_, marked := zenSessFailed[k]
+	zenSessFailedMu.Unlock()
+	if marked {
+		t.Fatal("failure mark of a removed key must be pruned")
+	}
+	// 未移除的 key 不受影响
+	k2 := "sk-kept"
+	StickyZenIdentity(k2)
+	sess := zenSessions[k2].Session
+	pruneZenKeyState(map[string]bool{k2: true})
+	zenSessMu.Lock()
+	kept := zenSessions[k2].Session
+	zenSessMu.Unlock()
+	if kept != sess {
+		t.Fatal("session of a still-configured key must survive prune")
 	}
 }
 

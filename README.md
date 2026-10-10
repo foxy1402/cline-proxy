@@ -92,6 +92,8 @@ No other variables are needed for a working stack: zen session IDs are minted lo
 
 To seed Cline accounts on first boot, drop a `cline-seed.json` file into the volume (see [Seeding accounts](#seeding-accounts)).
 
+> **Public HTTPS:** `docker-compose.yml` ships an optional `caddy` service (profile `tls`) with a ready `Caddyfile` for automatic Let's Encrypt certificates. Set `DOMAIN` in `.env`, then `docker compose --profile tls up -d`. On Portainer/NAS, put the proxy behind your existing reverse proxy instead and forward to port `3457`.
+
 > **Bind-mount note (Portainer/NAS users):** the container runs as a non-root user, so a **named volume** (`-v cline-proxy-data:/app/data`) is preferred. If you bind-mount a host directory (e.g. `-v /opt/cline-proxy-data:/app/data`), pre-create it and chown it to UID 1000 (`chown -R 1000:1000 /opt/cline-proxy-data`) or the gateway cannot write its state files and will fail to persist accounts.
 
 ## Configuration
@@ -112,7 +114,7 @@ All state lives in the `/app/data` volume — dotfiles written `0600`: `.cline-a
 | `CLINE_ACCOUNTS_SEED_FILE` | empty | Seed JSON imported at boot when the pool is empty |
 | `CLINE_USE_PROXIES` | `false` | Route the Cline upstream through the egress proxy pool |
 | `LOG_REQUESTS` | `true` | Request logging (metadata only: IP, path, model, status, duration — never conversation content) |
-| `LOG_FILE_MAX_MB` | `10` | `requests.jsonl` size cap; wiped when exceeded |
+| `LOG_FILE_MAX_MB` | `10` | Size cap for `requests.jsonl` (wiped when exceeded) and for `cline-proxy.log` (rotated when exceeded) |
 | `MAX_BODY_MB` | `32` | Request body limit; larger bodies get `413` |
 | `APPLY_SYSTEM_PROMPT_OVERRIDE` | `false` | `true` enables replacing client system prompts with `override.md` |
 | `STREAM_LOG` | `false` | Dump raw Anthropic-path SSE to disk (full conversations — debugging only) |
@@ -216,7 +218,8 @@ Project layout:
 ├── internal/cline/          cline upstream auth (WorkOS OAuth refresh)
 ├── internal/kit/            HTTP client, random IDs, zen session-ID minting, data paths
 ├── Dockerfile               multi-arch (amd64 native + arm64 cross-compile), ~43 MB runtime image
-└── docker-compose.yml       source build, PROXY_PORT-parameterized
+├── docker-compose.yml       source build, PROXY_PORT-parameterized
+└── Caddyfile                optional TLS reverse proxy (compose `tls` profile)
 ```
 
 ## Credits

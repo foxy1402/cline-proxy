@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -145,6 +147,30 @@ func (w *statusWriter) Flush() {
 	}
 }
 
+// recoverMiddleware 兜底 panic：任何一个 handler 崩溃都只终止该请求（记录
+// panic 与堆栈），而不是杀掉整个进程 —— 进程死会同时切断所有在途 SSE 流，
+// 影响范围远超单个请求。放在最外层（包住 log 中间件），使日志中间件自身的
+// 崩溃也被兜住。若响应尚未写出，返回 500；已写出（流式进行中）则无法再改
+// 状态码，只能记录后结束该连接。
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 自持一个 statusWriter 跟踪是否已写出响应头，与本中间件在链上的
+		// 位置无关（流式进行中不能再改状态码，只能记录后结束该连接）。
+		sw := &statusWriter{ResponseWriter: w}
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("PANIC recovered on %s %s: %v\n%s", r.Method, r.URL.Path, rec, debug.Stack())
+				if sw.status == 0 {
+					writeJSON(sw, http.StatusInternalServerError, map[string]any{
+						"error": map[string]string{"message": "internal server error", "type": "api_error"},
+					})
+				}
+			}
+		}()
+		next.ServeHTTP(sw, r)
+	})
+}
+
 // requestLogMiddleware 记录所有进入代理的请求（API 调用与调用历史）。
 // LOG_REQUESTS=false 时跳过日志，但仍包一层 statusWriter —— 它实现了
 // http.Flusher，SSE 流式响应依赖它透传 Flush。
@@ -159,20 +185,22 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 
 		logEnabled := LogRequestsEnabled()
 		model := ""
+		tooLarge := false
 		if logEnabled {
 			// 读取请求体提取模型，并放回，避免影响后续处理
 			bodyBytes, err := io.ReadAll(r.Body)
 			if err != nil {
-				// 超限（或读失败）：直接 413，不进入业务处理
-				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+				// 超限（或读失败）：直接 413，不进入业务处理。不 return ——
+				// 落到下面的统一日志块，让被拒的超大请求也进请求日志
+				//（滥用诊断的盲区就是这些 413）。
+				tooLarge = true
+				writeJSON(sw, http.StatusRequestEntityTooLarge, map[string]any{
 					"error": map[string]string{
 						"message": fmt.Sprintf("request body too large (limit %d MB)", MaxRequestBodyBytes()>>20),
 						"type":    "invalid_request_error",
 					},
 				})
-				return
-			}
-			if len(bodyBytes) > 0 {
+			} else if len(bodyBytes) > 0 {
 				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 				var probe struct {
 					Model string `json:"model"`
@@ -183,7 +211,9 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		next.ServeHTTP(sw, r)
+		if !tooLarge {
+			next.ServeHTTP(sw, r)
+		}
 
 		if !logEnabled {
 			return

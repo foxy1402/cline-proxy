@@ -1,0 +1,26 @@
+# Caddy reverse proxy for the optional `tls` compose profile.
+#
+# Enable with:
+#   DOMAIN=proxy.example.com docker compose --profile tls up -d
+#
+# DOMAIN is injected by the compose `caddy` service; Caddy obtains and renews a
+# Let's Encrypt certificate automatically. The upstream is the cline-proxy
+# container on the compose network (service name resolves via Docker DNS).
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The upstream is the cline-proxy container on the compose network (service
+	# name resolves via Docker DNS). {$PROXY_PORT:3457} honors a custom port.
+	reverse_proxy cline-proxy:{$PROXY_PORT:3457} {
+		flush_interval -1
+		# Long agentic runs: no read timeout on the proxy leg.
+		transport http {
+			read_timeout 0
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

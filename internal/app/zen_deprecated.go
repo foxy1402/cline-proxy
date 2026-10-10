@@ -97,7 +97,9 @@ func saveZenDepsLocked() {
 }
 
 // zenDeprecatedReplacement 返回已弃用模型的继任者（无映射时返回 ""）。
+// 键统一规范化（小写去 opencode/ 前缀），与 zenMarkModelDead 同口径。
 func zenDeprecatedReplacement(id string) string {
+	id = normalizeZenModelID(id)
 	zenDepMu.Lock()
 	defer zenDepMu.Unlock()
 	loadZenDepsLocked()
@@ -110,8 +112,11 @@ func zenDeprecatedReplacement(id string) string {
 // zenRecordDeprecation 记录并持久化一条 410 迁移映射；继任者已弃用时返回 ""
 // （调用方放弃迁移）。别名链不允许成环/成串：继任者若本身也是别名，返回 ""
 // 放弃——一次请求最多迁移一跳，防止 A→B→C 无限重试。
+// 两侧 ID 均规范化为小写去前缀，保证与查询侧（zenDeprecatedReplacement）
+// 同键；否则 chat 路径传入 "opencode/x" 会写进去、按 "x" 查却查不到。
 func zenRecordDeprecation(deadID, replacement string) string {
-	replacement = strings.TrimSpace(replacement)
+	deadID = normalizeZenModelID(deadID)
+	replacement = normalizeZenModelID(replacement)
 	if replacement == "" || replacement == deadID {
 		return ""
 	}
@@ -131,29 +136,52 @@ func zenRecordDeprecation(deadID, replacement string) string {
 	return replacement
 }
 
-// zenModelDeadUntilSync 400 "Model is unavailable" 的死亡标记（内存态，
-// 每次成功目录同步清空——syncZenModels 用 zenClearDeadModels）。
-var zenDeadModels = map[string]bool{}
+// zenModelDeadUntilSync 400 "Model is unavailable" 的死亡标记。每次成功目录
+// 同步清空（syncZenModels 用 zenClearDeadModels）；另有 zenDeadTTL 兜底——
+// 目录同步可能长期失败（registry 不可达），只靠同步清空会让模型被永久钉死。
+var zenDeadModels = map[string]int64{} // model id -> 标记时间(unix 秒)
 
-// zenMarkModelDead 标记模型死亡到下次同步。
+// zenDeadTTL 死亡标记最长存活时长。超过后自动失效并允许再次探测上游，
+// 避免同步长期失败时一个瞬时 400 把模型永久下线。
+const zenDeadTTL = time.Hour
+
+// zenMarkModelDead 标记模型死亡（记下时间，供 TTL 判定）。键规范化，
+// 与查询侧同口径。
 func zenMarkModelDead(id string) {
+	id = normalizeZenModelID(id)
+	if id == "" {
+		return
+	}
 	zenDepMu.Lock()
-	zenDeadModels[id] = true
+	zenDeadModels[id] = time.Now().Unix()
 	zenDepMu.Unlock()
 }
 
-// zenModelDead 模型是否已被标记死亡（路由层据此跳过，不再白烧请求）。
+// zenModelDead 模型是否仍在死亡 TTL 内（路由层据此跳过，不再白烧请求）。
+// 过期条目就地删除并返回 false，无需等待目录同步。
 func zenModelDead(id string) bool {
+	id = normalizeZenModelID(id)
+	if id == "" {
+		return false
+	}
 	zenDepMu.Lock()
 	defer zenDepMu.Unlock()
-	return zenDeadModels[id]
+	since, ok := zenDeadModels[id]
+	if !ok {
+		return false
+	}
+	if time.Now().Unix()-since > int64(zenDeadTTL/time.Second) {
+		delete(zenDeadModels, id)
+		return false
+	}
+	return true
 }
 
 // zenClearDeadModels 目录同步成功后清空死亡标记（上游列表已刷新，
 // 之前的 400 可能只是目录滞后）。
 func zenClearDeadModels() {
 	zenDepMu.Lock()
-	zenDeadModels = map[string]bool{}
+	zenDeadModels = map[string]int64{}
 	zenDepMu.Unlock()
 }
 

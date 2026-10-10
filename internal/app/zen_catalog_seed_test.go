@@ -3,6 +3,7 @@ package app
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -150,5 +151,99 @@ func TestApplyZenCatalogSeedsUpstreamFromNPM(t *testing.T) {
 	// 种子的 muse-spark 提示（Upstream=responses + npm 缺失）不被 npm 重播种破坏
 	if m := zenSeedModels[5]; m.ID != "muse-spark-1.3-contributor-free" || m.Upstream != "responses" {
 		t.Errorf("muse-spark seed entry changed unexpectedly: %+v", m)
+	}
+}
+
+// 学习器改过端点的条目（Source=learned）必须仍是免费模型：big-pickle 这类
+// 无 -free 后缀的模型全靠 Source 入选，抹成 learned 后不能掉出免费表。
+func TestLearnedSourceStaysFree(t *testing.T) {
+	for _, src := range []string{"seed", "live", "learned"} {
+		m := &ZenModel{ID: "big-pickle", Source: src}
+		if !isZenFreeModel(m) {
+			t.Errorf("Source=%q must be treated as free (no -free suffix)", src)
+		}
+	}
+}
+
+// applyZenCatalog 不得抹掉学习的 Source 标记：它是"npm 不再重播种"的契约，
+// 也是 saveZenEndpoints 写盘时的筛选条件。保留标记后，即便 reapply 尚未运行，
+// 学习决策也已在表里生效。
+func TestApplyZenCatalogPreservesLearnedMarker(t *testing.T) {
+	zenModelsMu.Lock()
+	savedModels, savedAliases := zenModels, zenAliases
+	zenModels = map[string]*ZenModel{
+		"learned-chat": {ID: "learned-chat", Source: "learned", Upstream: ""},
+	}
+	zenAliases = map[string]*ZenModel{}
+	zenModelsMu.Unlock()
+	defer func() {
+		zenModelsMu.Lock()
+		zenModels, zenAliases = savedModels, savedAliases
+		zenModelsMu.Unlock()
+	}()
+
+	// 目录说该模型是 @ai-sdk/openai（会播成 responses）——学习器的 chat 定论
+	// 必须压住它，且 Source 标记要留下来。
+	desired := map[string]bool{"learned-chat": true}
+	overlay := map[string]zenModelOverlay{"learned-chat": {NPM: "@ai-sdk/openai"}}
+	applyZenCatalog(desired, overlay)
+
+	zenModelsMu.RLock()
+	m := zenModels["learned-chat"]
+	zenModelsMu.RUnlock()
+	if m.Upstream != "" {
+		t.Errorf("learned chat decision clobbered to %q by catalog npm seeding", m.Upstream)
+	}
+	if m.Source != "learned" {
+		t.Errorf("Source = %q, want %q (marker must survive applyZenCatalog)", m.Source, "learned")
+	}
+	if !isZenFreeModel(m) {
+		t.Error("learned-marker entry must remain a free model")
+	}
+}
+
+// cost 键缺失必须 fail-closed（不入免费池）：目录漏填价格字段的模型若被当作
+// 免费，网关会把它路由到 zen 而用户实际要付费/被拒。
+func TestFetchZenRegistryMissingCostFailsClosed(t *testing.T) {
+	payload := `{
+  "opencode": {"models": {
+    "no-cost":    {"id": "no-cost"},
+    "has-cost":   {"id": "has-cost", "cost": {"input": 0, "output": 0}}
+  }}
+}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+	old := zenRegistryURL
+	zenRegistryURL = srv.URL
+	defer func() { zenRegistryURL = old }()
+
+	_, freeGate, ok := fetchZenRegistry()
+	if !ok {
+		t.Fatal("registry unreachable")
+	}
+	if freeGate["no-cost"] {
+		t.Error("a model with no cost key must NOT pass the free gate (fail-closed)")
+	}
+	if !freeGate["has-cost"] {
+		t.Error("has-cost (0/0) must still pass the gate")
+	}
+}
+
+// 目录响应超过体积上限时按不可达处理，不把超大响应读进内存。
+func TestFetchZenRegistryBodyCap(t *testing.T) {
+	big := strings.Repeat("x", maxRegistryBytes+1024)
+	payload := `{"opencode":{"models":{"m":{"id":"m","cost":{"input":0,"output":0},"pad":"` + big + `"}}}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+	old := zenRegistryURL
+	zenRegistryURL = srv.URL
+	defer func() { zenRegistryURL = old }()
+
+	if _, _, ok := fetchZenRegistry(); ok {
+		t.Fatal("an over-cap registry body must be treated as unreachable")
 	}
 }

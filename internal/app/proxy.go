@@ -8,15 +8,18 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/textproto"
 	"os"
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -117,7 +120,8 @@ func StartProxy(host string, port int) error {
 		return corsHandler(func(w http.ResponseWriter, r *http.Request) {
 			key := r.Header.Get("x-api-key")
 			if key == "" {
-				if b := r.Header.Get("Authorization"); len(b) > 7 && b[:7] == "Bearer " {
+				// RFC 7235: "Bearer" 前缀大小写不敏感（客户端可能发 "bearer"）。
+				if b := r.Header.Get("Authorization"); len(b) > 7 && strings.EqualFold(b[:7], "Bearer ") {
 					key = b[7:]
 				}
 			}
@@ -208,7 +212,9 @@ func StartProxy(host string, port int) error {
 
 	chatHandler := apiKeyHandler(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+				"error": map[string]string{"message": "method not allowed", "type": "invalid_request_error"},
+			})
 			return
 		}
 
@@ -345,7 +351,9 @@ func StartProxy(host string, port int) error {
 	// Anthropic Messages API support
 	anthropicHandler := apiKeyHandler(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+				"error": map[string]string{"message": "method not allowed", "type": "invalid_request_error"},
+			})
 			return
 		}
 		handleAnthropicMessages(w, r)
@@ -368,7 +376,7 @@ func StartProxy(host string, port int) error {
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
-		Handler:           requestLogMiddleware(mux),
+		Handler:           recoverMiddleware(requestLogMiddleware(mux)),
 	}
 
 	fmt.Println("")
@@ -408,16 +416,83 @@ func StartProxy(host string, port int) error {
 	}
 }
 
+// rotatingLogWriter 给日志文件加大小上限：超过 maxBytes 就把当前文件轮转为
+// .1（覆盖上一个 .1），再重新打开主文件继续追加。log.SetOutput 只在启动时
+// 设置一次，因此轮转必须发生在 Writer 内部，不能靠外部定期检查。
+//
+// 与 requests.jsonl 的"超限即清空"不同，日志文件用轮转保留上一份历史
+//（.1），排查"崩溃前发生了什么"时不至于丢失全部上下文。
+type rotatingLogWriter struct {
+	mu       sync.Mutex
+	path     string
+	maxBytes int64
+	f        *os.File
+	size     int64
+}
+
+func newRotatingLogWriter(path string, maxBytes int64) (*rotatingLogWriter, error) {
+	w := &rotatingLogWriter{path: path, maxBytes: maxBytes}
+	if err := w.open(); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (w *rotatingLogWriter) open() error {
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	var size int64
+	if st, err := f.Stat(); err == nil {
+		size = st.Size()
+	}
+	w.f, w.size = f, size
+	return nil
+}
+
+func (w *rotatingLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return len(p), nil // 打开失败时静默丢弃文件副本（stderr 仍有日志）
+	}
+	n, err := w.f.Write(p)
+	w.size += int64(n)
+	if w.maxBytes > 0 && w.size >= w.maxBytes {
+		w.rotateLocked()
+	}
+	return n, err
+}
+
+// rotateLocked 关闭当前文件、轮转为 .1、重开主文件。调用方须持锁。
+func (w *rotatingLogWriter) rotateLocked() {
+	_ = w.f.Close()
+	rotated := w.path + ".1"
+	_ = os.Remove(rotated)
+	_ = os.Rename(w.path, rotated)
+	if err := w.open(); err != nil {
+		w.f = nil
+	}
+}
+
+// logFileMaxBytes 日志文件轮转阈值：LOG_FILE_MAX_MB 同样适用于 cline-proxy.log
+//（默认 10MB）。轮转保留一份 .1 历史。
+func logFileMaxBytes() int64 {
+	return LogFileMaxBytes()
+}
+
 // initLogFile 将日志同时输出到控制台与 cline-proxy.log（追加模式），
 // 控制台窗口滚动内容有限，文件可完整保留所有日志。
+// 文件侧带大小上限（见 rotatingLogWriter）：长跑实例不会撑爆磁盘。
 func initLogFile() {
 	path := kit.ResolveDataPath("cline-proxy.log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	rw, err := newRotatingLogWriter(path, logFileMaxBytes())
 	if err != nil {
 		log.Printf("  open log file failed: %v", err)
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.SetOutput(io.MultiWriter(os.Stderr, rw))
 	log.Printf("========== proxy started, log file: %s ==========", path)
 }
 
@@ -875,41 +950,126 @@ func enforceToolChoiceNone(body map[string]any) {
 	}
 }
 
+// Cline 上游客户端指纹版本。官方 CLI 3.0.70（X-CLIENT-TYPE: cline-cli，
+// core 0.0.92），核对自 sdk 的 request-headers.ts / cline-client-headers.ts。
+// Cline 网关对被限制在 Cline 产品面的免费模型会校验这些身份头，缺失可能 403。
+const (
+	clineClientVersion = "3.0.70"
+	clineCoreVersion   = "0.0.92"
+)
+
+// clineHeaders 构造上游请求头。用 setRawHeader（而非 Header.Set）保留官方
+// 客户端的精确大小写（Set 会把键规范化成 X-Task-Id / Http-Referer 等），
+// 字节级对齐客户端指纹；同时删除同名的其它大小写变体，避免 map 里同时存在
+// "X-CLIENT-VERSION" 与 "X-Client-Version" 两个键、上线发出重复头。
+// cfg.Headers 仍可覆盖（管理员自定义优先）。
 func clineHeaders(token, sessionID string) http.Header {
 	h := http.Header{}
-	h.Set("Authorization", "Bearer "+token)
-	h.Set("Content-Type", "application/json")
-	h.Set("X-Task-ID", sessionID)
+	setRawHeader(h, "Authorization", "Bearer "+token)
+	setRawHeader(h, "Content-Type", "application/json")
 	// Go 默认 UA（Go-http-client/1.1）是指纹异常点，容易被上游风控拦截；
 	// 与管理面板探测请求保持一致的客户端标识。cfg.Headers 里可覆盖。
-	h.Set("User-Agent", "Cline/3.0.50")
+	setRawHeader(h, "User-Agent", "Cline/"+clineClientVersion)
+	setRawHeader(h, "HTTP-Referer", "https://cline.bot")
+	setRawHeader(h, "X-Title", "Cline")
+	setRawHeader(h, "X-IS-MULTIROOT", "false")
+	setRawHeader(h, "X-CLIENT-TYPE", "cline-cli")
+	setRawHeader(h, "X-CLIENT-VERSION", clineClientVersion)
+	setRawHeader(h, "X-PLATFORM", "cli")
+	setRawHeader(h, "X-PLATFORM-VERSION", clineClientVersion)
+	setRawHeader(h, "X-CORE-VERSION", clineCoreVersion)
+	if sessionID != "" {
+		setRawHeader(h, "X-Task-ID", sessionID)
+	}
 
 	cfg := getProxyConfig()
 	for k, v := range cfg.Headers {
-		h.Set(k, v)
+		setRawHeader(h, k, v)
 	}
 
 	return h
+}
+
+// setRawHeader 以给定 key 原样写入（保留大小写），并删除同名的其它大小写
+// 变体——HTTP 头大小写不敏感，但 Go 的 http.Header 是 map[大小写敏感 key]，
+// 同时存在两个变体时网络层会把两个键都发出去（重复头）。
+func setRawHeader(h http.Header, key, value string) {
+	canon := textproto.CanonicalMIMEHeaderKey(key)
+	for existing := range h {
+		if existing != key && textproto.CanonicalMIMEHeaderKey(existing) == canon {
+			delete(h, existing)
+		}
+	}
+	h[key] = []string{value}
 }
 
 // clineAPIBase cline 上游基址。包级变量便于测试把真实调用链指向本地假上游
 // （cline.ClineAPIBase 是常量、不可注入）；生产恒为 cline.ClineAPIBase。
 var clineAPIBase = cline.ClineAPIBase
 
-// callClineAPI 调用 cline 上游。
+// callClineAPI 调用 cline 上游，带跨账号 failover。
 // ctx 来自客户端请求: IDE abort/取消时立即终止,不冷却账号。
 // useProxies 为 true 时走出口代理池（每次尝试 round-robin 挑选）;
 // 代理路径上的网络错误只冷却代理本身,绝不冷却账号 —— 代理故障不污染账号池。
+//
+// failover（P2 修复）：429/5xx 时换下一个账号重试（至多 clineFailoverAttempts
+// 个账号）。此前只 pick 一次账号，一个账号撞上 429 即整请求 500，池子里其它
+// 健康账号救不了本次请求——N 个账号的可用性退化成 1。429 会先把该账号冷却，
+// 因此换到的必然是别的账号；5xx 不冷却（可能是上游瞬时故障），但也换账号试。
+// 只在尚未向客户端流出任何内容时发生（本函数在流式转发之前），因此重试安全。
 func callClineAPI(ctx context.Context, params map[string]any, stream bool, useProxies bool) (*http.Response, *Account, error) {
-	acc := pickAccount()
-	if acc == nil {
-		return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
-	}
+	var lastErr error
+	var lastAcc *Account
+	tried := map[string]bool{}
+	for i := 0; i < clineFailoverAttempts; i++ {
+		acc := pickAccountExcluding(tried)
+		if acc == nil {
+			if lastErr != nil {
+				// 所有可用账号都试过了：返回最后一次的真实错误（比"无账号"更有信息量）
+				return nil, lastAcc, lastErr
+			}
+			return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
+		}
+		tried[acc.AccountID] = true
+		lastAcc = acc
 
+		resp, err := clineAPIWithAccount(ctx, params, stream, useProxies, acc)
+		if err == nil {
+			return resp, acc, nil
+		}
+		lastErr = err
+		var ce *clineAPIError
+		if !errors.As(err, &ce) {
+			// 网络/令牌/取消等错误：不换账号（换账号无助于网络层故障，且
+			// 取消必须立即终止）。直接返回。
+			return nil, acc, err
+		}
+		// 只对 429 / 5xx 换账号；4xx（400/401/403 等）重试无意义，原样返回。
+		if ce.Status != http.StatusTooManyRequests && ce.Status < 500 {
+			return nil, acc, err
+		}
+		// "500 empty response content" 是模型属性（该模型必须流式），不是账号
+		// 故障：换账号徒劳，且会拖慢 callClineAutoStream 的"学习+改流式重试"。
+		// 原样返回，让上层去学。
+		if clineEmptyStreamErr(ce.Status, []byte(ce.Body)) {
+			return nil, acc, err
+		}
+		log.Printf("  cline failover: account=%s got %d, trying another account (%d/%d)",
+			truncateEmail(acc.Email), ce.Status, i+1, clineFailoverAttempts)
+	}
+	return nil, lastAcc, lastErr
+}
+
+// clineFailoverAttempts 单次请求最多尝试的账号数（429/5xx 换账号）。
+const clineFailoverAttempts = 3
+
+// clineAPIWithAccount 用指定账号执行一次上游调用（含代理轮转与 401 刷新）。
+// 429/5xx 以 *clineAPIError 返回，交由 callClineAPI 决定是否换账号。
+func clineAPIWithAccount(ctx context.Context, params map[string]any, stream bool, useProxies bool, acc *Account) (*http.Response, error) {
 	token, err := ensureAccountToken(acc)
 	if err != nil {
 		// Try other accounts
-		return nil, nil, fmt.Errorf("account %s token failed: %w", acc.Email, err)
+		return nil, fmt.Errorf("account %s token failed: %w", acc.Email, err)
 	}
 
 	body := buildUpstreamBody(params, stream)
@@ -917,7 +1077,7 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
-		return nil, acc, fmt.Errorf("marshal body: %w", err)
+		return nil, fmt.Errorf("marshal body: %w", err)
 	}
 
 	toolCount := 0
@@ -949,7 +1109,7 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 		// 复用已发送的 req 会以 "ContentLength=N with Body length 0" 失败
 		req, rerr := http.NewRequestWithContext(ctx, "POST", clineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
 		if rerr != nil {
-			return nil, acc, fmt.Errorf("create request: %w", rerr)
+			return nil, fmt.Errorf("create request: %w", rerr)
 		}
 		req.Header = clineHeaders(token, sessionID)
 		resp, lastErr = client.Do(req)
@@ -957,7 +1117,7 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 			break
 		}
 		if ctx.Err() != nil {
-			return nil, acc, fmt.Errorf("client aborted: %w", lastErr)
+			return nil, fmt.Errorf("client aborted: %w", lastErr)
 		}
 		if useProxies {
 			// 隧道层失败才冷却,且只冷 2 分钟: 上游过载也会表现为连接重置,
@@ -968,11 +1128,11 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 		}
 		// 直连网络错误：临时短冷却 5 分钟
 		markAccountCooldown(acc, "network error: "+lastErr.Error(), 5*time.Minute)
-		return nil, acc, fmt.Errorf("upstream request: %w", lastErr)
+		return nil, fmt.Errorf("upstream request: %w", lastErr)
 	}
 	if lastErr != nil {
 		// 所有代理出口都失败（useProxies 时）——不冷却账号
-		return nil, acc, fmt.Errorf("upstream request (all proxy exits failed): %w", lastErr)
+		return nil, fmt.Errorf("upstream request (all proxy exits failed): %w", lastErr)
 	}
 
 	if resp.StatusCode == 401 {
@@ -982,14 +1142,14 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 			token = acc.AccessToken
 			req2, cerr := http.NewRequestWithContext(ctx, "POST", clineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
 			if cerr != nil {
-				return nil, acc, fmt.Errorf("create request: %w", cerr)
+				return nil, fmt.Errorf("create request: %w", cerr)
 			}
 			req2.Header = clineHeaders(token, sessionID)
 			// 注意: 不能用 := —— 那会在 if 块内遮蔽外层 resp，重试成功的
 			// 响应被丢弃（body 泄漏）而调用方仍拿到旧的 401
 			resp2, derr := client.Do(req2)
 			if derr != nil {
-				return nil, acc, fmt.Errorf("upstream retry: %w", derr)
+				return nil, fmt.Errorf("upstream retry: %w", derr)
 			}
 			if resp2.StatusCode == 401 {
 				resp2.Body.Close()
@@ -997,7 +1157,7 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 				acc.Status = "expired"
 				savePoolLocked()
 				poolMu.Unlock()
-				return nil, acc, fmt.Errorf("account %s token expired permanently", truncateEmail(acc.Email))
+				return nil, fmt.Errorf("account %s token expired permanently", truncateEmail(acc.Email))
 			}
 			resp = resp2
 		} else {
@@ -1005,7 +1165,7 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 			acc.Status = "expired"
 			savePoolLocked()
 			poolMu.Unlock()
-			return nil, acc, fmt.Errorf("account %s refresh failed: %w", truncateEmail(acc.Email), rerr)
+			return nil, fmt.Errorf("account %s refresh failed: %w", truncateEmail(acc.Email), rerr)
 		}
 	}
 
@@ -1019,16 +1179,28 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 			if duration <= 0 {
 				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
 			}
+			if duration <= 0 {
+				// 429 但既无 "Try again in ..." 也无 Retry-After: 无法区分
+				// 配额耗尽与瞬时限流。绝不落到 markAccountCooldown 的 18h 兜底——
+				// 那只有明确的配额信号才配得上，误判会把健康账号雪藏一整天。
+				if isClineQuotaExhausted(string(bodyBytes)) {
+					duration = 18 * time.Hour
+				} else {
+					duration = 20 * time.Minute
+				}
+				log.Printf("  429 without parseable wait on %s: defaulting to %v (quota=%v)",
+					truncateEmail(acc.Email), duration, isClineQuotaExhausted(string(bodyBytes)))
+			}
 			markAccountCooldown(acc, "429: "+reason, duration)
 			log.Printf("  account %s cooldown %v (reason: %s)", truncateEmail(acc.Email), duration, reason)
 		}
 		// 非 200 一律返回 error（body 已读尽并关闭），但状态码 + 错误体本身有价值：
 		// 类型化错误把它带出来，供 callClineAutoStream 识别"该模型必须流式"的指纹。
-		return nil, acc, &clineAPIError{Status: resp.StatusCode, Body: kit.Truncate(string(bodyBytes), 500)}
+		return nil, &clineAPIError{Status: resp.StatusCode, Body: kit.Truncate(string(bodyBytes), 500)}
 	}
 
 	bumpUsage(acc)
-	return resp, acc, nil
+	return resp, nil
 }
 
 // accountUsageFn 构造账号 token 记账回调：从上游 usage 提取
@@ -1176,6 +1348,24 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 				if line != "" {
 					w.Write([]byte(line + "\n"))
 				}
+				break
+			}
+			// 上游中途断流（非 EOF 的真实读错误，如 connection reset）：不能
+			// 静默 break —— 客户端会把截断的流当成正常结束（缺 finish/[DONE]），
+			// 表现为 IDE 里的"响应中断"。发一个终止性 error 事件再收尾，语义与
+			// Anthropic 路径（proxy.go 的 anthropic stream upstream error）和
+			// Responses 路径（responses.go 的 response.failed）一致。
+			log.Printf("  upstream stream interrupted (mid-stream read error): %v", err)
+			errChunk := map[string]any{
+				"error": map[string]any{
+					"message": kit.Truncate("upstream stream interrupted: "+err.Error(), 300),
+					"type":    "upstream_error",
+				},
+			}
+			if b, mErr := json.Marshal(errChunk); mErr == nil {
+				w.Write([]byte("data: " + string(b) + "\n\n"))
+				w.Write([]byte("data: [DONE]\n\n"))
+				flusher.Flush()
 			}
 			break
 		}
@@ -3194,6 +3384,22 @@ func parseHumanDuration(s string) time.Duration {
 		return 0
 	}
 	return total
+}
+
+// isClineQuotaExhausted 从 429 错误体判断是否为配额耗尽（而非瞬时限流）。
+// 只有明确的配额措辞才返回 true；429 缺少可解析时长时用它决定兜底冷却长度：
+// 配额耗尽 → 18h，其余 → 20min 短冷却。
+func isClineQuotaExhausted(body string) bool {
+	low := strings.ToLower(body)
+	for _, kw := range []string{
+		"quota", "exceeded", "insufficient", "out of credit", "no credits",
+		"daily limit", "monthly limit", "usage limit", "credit limit", "billing",
+	} {
+		if strings.Contains(low, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseRetryAfter 解析 HTTP Retry-After 头（秒数或 HTTP 日期）。

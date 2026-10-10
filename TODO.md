@@ -47,6 +47,74 @@ that malformed placeholder. Consequences, all landed:
   `.zen-model-aliases.json`, one retry per request); `400` "Model is
   unavailable" marks the model dead until the next catalog sync.
 
+## Audit-fix hardening round 2 (2026-10-10)
+
+Verified-and-fixed pass over the external audit (`cline-proxy-audit.md`) plus
+one bug found live during the container probe. All items landed with tests.
+
+**Cline path**
+- **Cross-account failover on 429/5xx** (`callClineAPI`): previously picked one
+  account per request and returned 500 on its 429 — the pool's N accounts
+  degraded to 1. Now retries up to 3 *different* accounts; 429 cools the tried
+  account first (so the retry lands elsewhere), 4xx/network/cancel return
+  immediately, and the "500 empty response content" fingerprint is excluded so
+  `callClineAutoStream`'s learn-and-restream still fires promptly.
+- **429 without a parseable wait** no longer falls through to the 18h default:
+  explicit quota wording → 18h; otherwise a 20-minute cooldown (prevents a
+  transient 429 from hiding a healthy account for a day).
+- **Cline header fidelity**: `clineHeaders` now sets the full CLI-identity set
+  (`HTTP-Referer`, `X-Title`, `X-IS-MULTIROOT`, `X-CLIENT-TYPE`,
+  `X-CLIENT-VERSION`, `X-PLATFORM`, `X-PLATFORM-VERSION`, `X-CORE-VERSION`)
+  with version `3.0.70`/core `0.0.92`, using a helper that preserves exact
+  mixed-case keys *and* de-duplicates case variants (raw assignment plus the
+  `Set`-based override loop previously put both `X-CLIENT-VERSION` and
+  `X-Client-Version` on the wire). `defaultProxyConfig` defaults updated to match.
+  Header set verified wire-level (`TestClineHeadersOnTheWire`) against the audit
+  table (`request-headers.ts` / `cline-client-headers.ts`, CLI 3.0.70).
+- **Zen UA bumped** `opencode/1.18.31` → `1.18.35` (app version; the
+  `ai-sdk/provider-utils` and `runtime/bun` segments stay — they track the TLS
+  fingerprint in `tls_bun.go`, not the CLI version). Gate headers (`x-opencode-*`,
+  lowercase) verified wire-level (`TestZenHeadersOnTheWire`).
+- **RFC 7235 case-insensitive `Bearer`** prefix accepted at `/v1` auth.
+
+**Zen path**
+- **`/v1/responses` with a native-responses model** (muse-spark) always hit the
+  chat endpoint and 400'd `ModelProtocolUnsupported` — a live-found bug. The
+  entry point now branches on `zm.Upstream == "responses"`, aggregates the
+  native SSE, and reuses the existing chat→responses conversion (streaming and
+  non-streaming both verified live).
+- **403 recovery** (already in 6921e57): same-key single re-mint then cooldown;
+  the panel probe never mutates session state.
+- **Dead-model marks get a 1h TTL** (cleared early by a successful sync); a
+  model with a working 410 alias is no longer hard-rejected by a stale mark.
+- **Model IDs normalized** (lowercase, `opencode/` stripped) across
+  `resolveZenModel`, `routeModel`, dead-mark and alias maps — `Big-Pickle` /
+  `opencode/big-pickle` no longer misroute to the cline pool or miss their marks.
+- **Registry fetch hardening**: 8 MiB body cap; the free gate now requires the
+  `cost` key to be present (fail-closed on schema change instead of admitting a
+  model with a missing price field).
+- **`isRateLimited`** recognizes quota-shaped 403/502 bodies
+  (`quota|exceeded|insufficient`).
+- **`kit.FreshZenIdentity`** (anonymous fallback) now mints a gate-valid
+  `MintZenSessionID` instead of the invalid `sess_`+26 placeholder.
+- **Session-file safety**: a non-ENOENT read error blocks this run's writes
+  (never clobbers an unreadable file); `refreshZenSession` refuses to re-create
+  a key removed from config.
+- **Duplicated gate-header blocks** collapsed into `setZenGateHeaders` with a
+  contract test (both upstream paths).
+- **`zenExtractReplacement`** also reads `error.details` / `error.data` /
+  `metadata` nesting and falls back to a regex scan for non-JSON bodies.
+
+**Process / infra**
+- Panic-recovery middleware around the mux (a panic previously killed the
+  process and severed every in-flight SSE stream).
+- `cline-proxy.log` rotates at `LOG_FILE_MAX_MB` like `requests.jsonl`.
+- CI `vet` job now runs `go test ./...`; `go.mod` toolchain pinned to `1.26.0`
+  to match the Dockerfile/CI; `go mod tidy` dropped the unused `x/text` dep.
+- 413-rejected oversized requests are now written to the request log.
+- `envInt` warns on malformed values (parity with `envBool`); `/v1` 405s use
+  the standard `{"error":{"message",...}}` shape; Caddyfile added for the
+  compose `tls` profile.
 
 ## Current state (audit 2026-09-15)
 

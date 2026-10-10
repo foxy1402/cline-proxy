@@ -47,9 +47,15 @@ var (
 	zenSessions   = map[string]*zenSessionEntry{} // zen key -> sticky identity
 	zenSessLoaded bool
 	zenSessPath   string
-	// zenNativeUA 官方 CLI 1.18.31 的原生 ai-sdk 形态 UA（会话粘性与
-	// 轮换列表共用；与 tls_bun.go 指纹版本耦合——升版本需同步这两处）。
-	zenNativeUA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
+	// zenSessSaveBlocked 会话文件读取失败（非 ENOENT）时置位：此时内存表是空的，
+	// 任何 save 都会把磁盘上读不到的原文件覆盖掉。宁可本次运行不落盘，也不能
+	// 销毁可能有价值的数据（重启后重试读取）。
+	zenSessSaveBlocked bool
+	// zenNativeUA 官方 CLI 的原生 ai-sdk 形态 UA（会话粘性与轮换列表共用）。
+	// opencode 版本按最新 CLI 核对（audit 2026-10-10：1.18.31 → 1.18.35）；
+	// ai-sdk / bun 段保持不变——它们对应 TLS 指纹（tls_bun.go 的 Bun hello），
+	// 与 opencode 应用版本无关，改动这两段才会与指纹失配。
+	zenNativeUA = "opencode/1.18.35 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
 )
 
 // zenSessionFile 会话持久化路径（DATA_DIR 优先，容器 volume 挂载点）。
@@ -73,7 +79,8 @@ func loadZenSessions() {
 		// ENOENT 是首启正常路径（还没有会话文件）；其他错误要让运维看见，
 		// 否则会静默以空表运行，并在下次 save 时把原文件覆盖掉。
 		if !os.IsNotExist(err) {
-			log.Printf("zen sessions read failed (%s): %v", zenSessionFile(), err)
+			log.Printf("zen sessions read failed (%s): %v — refusing to persist this run to avoid clobbering it", zenSessionFile(), err)
+			zenSessSaveBlocked = true
 		}
 		return
 	}
@@ -127,6 +134,10 @@ func loadZenSessions() {
 
 // saveZenSessionsLocked 持久化当前会话表（调用方持有 zenSessMu）。
 func saveZenSessionsLocked() {
+	// 读取阶段失败（非 ENOENT）时内存表不可信，落盘会覆盖磁盘上读不到的文件。
+	if zenSessSaveBlocked {
+		return
+	}
 	data, err := json.MarshalIndent(zenSessions, "", "  ")
 	if err != nil {
 		return
@@ -238,21 +249,16 @@ func StickyZenIdentity(key string) (sess, req, ua string) {
 	return e.Session, "msg_" + kit.RandAlphaNum(26), e.UA
 }
 
-// pruneZenKeyState 配置变更后清理已移除 key 的运行时状态（会话粘性 + 403 恢复计数）。
+// pruneZenKeyState 配置变更后清理已移除 key 的运行时状态（会话粘性 + 403 印记）。
 // valid 为当前有效 key 集合。
 func pruneZenKeyState(valid map[string]bool) {
-	zenRecoverMu.Lock()
-	for k := range zenRecoverFails {
+	zenSessFailedMu.Lock()
+	for k := range zenSessFailed {
 		if !valid[k] {
-			delete(zenRecoverFails, k)
+			delete(zenSessFailed, k)
 		}
 	}
-	for k := range zenRecoverLastAt {
-		if !valid[k] {
-			delete(zenRecoverLastAt, k)
-		}
-	}
-	zenRecoverMu.Unlock()
+	zenSessFailedMu.Unlock()
 
 	zenSessMu.Lock()
 	removed := 0
@@ -272,64 +278,85 @@ func pruneZenKeyState(valid map[string]bool) {
 }
 
 // ============ 403 恢复：本地换新会话 ============
+//
+// 语义（重构后，替代旧的"连续 2 次 403 + 后台异步换新"）：
+//   - 请求路径收到 FreeTier 403 后同步换一次会话（本请求内至多一次，由调用点的
+//     sessionRetried 标志保证），随后在**同一 key** 上重试——不再跨 key 扇出。
+//     跨 key 扇出是错的：403 针对的是 key/会话，换到别的 key 只会把同一批坏
+//     状态扩散到全池，而不是绕过它。
+//   - 同 key 换新后仍 403 ⇒ 该 key 会话/额度窗口确实不可用，短暂冷却该 key 并
+//     快速失败，不发第三种请求形态。
+//   - pinKey（面板 Test）探测完全不触碰会话状态、不冷却、不重试：探测结论只属于
+//     那次点击，绝不能污染生产 key 状态。
+//
+// 若 zen 收紧门禁（合法格式也被拒），冷却+快速失败会让 403 更早浮现，而换新
+// 频率仍是日志里的门禁变化信号。
 
-var (
-	zenRecoverMu     sync.Mutex
-	zenRecoverFails  = map[string]int{}   // key -> 连续 FreeTier 403 次数
-	zenRecoverLastAt = map[string]int64{} // key -> 上次换新尝试时刻（unix 秒）
-)
-
-// zenRefreshBackoff 单 key 连续换新的最小间隔：防 403 热循环，远短于旧
-// 收割机的 10 分钟——本地铸造零成本，换新只需要一次内存写 + 文件保存。
-const zenRefreshBackoff = time.Minute
-
-// zenSessionMarkSuccess 2xx 后清零该 key 的连续 403 计数（调用点在两条
-// 上游调用路径的 200 分支）。
+// zenSessionMarkSuccess 2xx 后清除该 key 的 403 印记（成功即该 key 现在可用，
+// 后续偶发 403 重新按"本请求内换新一次"处理）。调用点在两条上游调用路径的 200
+// 分支；对未标记的 key 是无害 no-op。
 func zenSessionMarkSuccess(key string) {
 	if key == "" {
 		return
 	}
-	zenRecoverMu.Lock()
-	delete(zenRecoverFails, key)
-	zenRecoverMu.Unlock()
+	zenSessFailedMu.Lock()
+	delete(zenSessFailed, key)
+	zenSessFailedMu.Unlock()
 }
 
-// refreshZenSession FreeTier 403 的恢复动作：连续 2 次 403（且过了 key 级
-// 退避）就把该 key 的粘性会话换成本地铸造的新 ID。异步调用（go refresh…），
-// 不阻塞请求路径；与收割机不同，这里没有子进程、没有额度消耗。
-// 若 zen 收紧门禁（合法格式也被拒），换新只会继续 403——换新频率升高本身
-// 就是日志里的门禁变化信号。
+// zenSessFailedMu/zenSessFailed 记录"换新后仍 403"的 key（tripwire/面板观测）。
+// 只增不用于限流决策——限流决策在调用点用本请求的 sessionRetried 标志完成。
+var (
+	zenSessFailedMu sync.Mutex
+	zenSessFailed   = map[string]int{}
+)
+
+// zenSessionFailed 记录该 key 在最近一次请求里"换新后仍 403"的失败印记，
+// 供面板/日志观测（tripwire）。返回是否是新印记。
+func zenSessionFailed(key string) {
+	if key == "" {
+		return
+	}
+	zenSessFailedMu.Lock()
+	zenSessFailed[key]++
+	zenSessFailedMu.Unlock()
+}
+
+// refreshZenSession 同步把该 key 的粘性会话换成本地铸造的新 ID（新会话、保留 UA）。
+// 幂等且零成本（无子进程、无额度消耗）：FreeTier 403 的调用点在本请求内至多调用
+// 一次，然后同 key 重试。key 为空/"public" 或无 key 配置时不动（哨兵无凭据）；
+// 已从配置移除的 key 也不重建——否则 pruneZenKeyState 刚清掉的条目会被这里复活，
+// 让 .zen-sessions.json 单调增长。
 func refreshZenSession(key string) {
 	if key == "" || key == "public" {
 		return
 	}
-	zenRecoverMu.Lock()
-	n := zenRecoverFails[key] + 1
-	zenRecoverFails[key] = n
-	last := zenRecoverLastAt[key]
-	now := time.Now()
-	due := now.Sub(time.Unix(last, 0)) >= zenRefreshBackoff
-	refresh := n >= 2 && due
-	if refresh {
-		zenRecoverLastAt[key] = now.Unix()
-	}
-	zenRecoverMu.Unlock()
-	if !refresh {
+	if !zenKeyConfigured(key) {
 		return
 	}
 	loadZenSessions()
 	zenSessMu.Lock()
 	e, ok := zenSessions[key]
 	if !ok {
+		// key 未在会话表里（例如首次即 403）：建一个新条目即可，下次请求复用。
 		e = &zenSessionEntry{UA: zenNativeUA}
 		zenSessions[key] = e
 	}
 	e.Session = kit.MintZenSessionID()
-	e.CreatedAt = now.Unix()
+	e.CreatedAt = time.Now().Unix()
 	e.Minted = true
 	saveZenSessionsLocked()
 	sess := e.Session
 	zenSessMu.Unlock()
-	log.Printf("zen session refreshed locally for key#%d after %d consecutive 403(s): %s",
-		keyIndex(key), n, kit.Truncate(sess, 24))
+	log.Printf("zen session refreshed locally for key#%d: %s", keyIndex(key), kit.Truncate(sess, 24))
+}
+
+// zenKeyConfigured key 是否仍在当前 zen key 池中。
+func zenKeyConfigured(key string) bool {
+	for _, k := range getZenConfig().Keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
