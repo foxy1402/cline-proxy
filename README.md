@@ -127,11 +127,15 @@ Fail-closed startup: binding a non-loopback address without `API_KEY` and `ADMIN
 
 Zen session IDs are **minted locally** — the upstream's free-tier gate is a stateless format check (`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`), so the gateway generates a compatible, stable ID per zen key at first use and persists it in the data volume (`.zen-sessions.json`). There is no embedded CLI, no harvester, and no related environment variables. Legacy placeholder IDs (`sess_*`) in an existing session file are replaced with minted ones on first load.
 
+The same format check now also applies to the per-request id (`x-opencode-request`, `^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`) and to the injected gate tools — so the request id is minted with the same descending construction as the session id, and the eleven gate tools carry the real opencode CLI parameter schemas (an empty `{"type":"object","properties":{}}` schema is rejected with `403 FreeTierError`; the tool descriptions are not checked). This is what the upstream's 2026-10 gateway change tightened.
+
 On repeated FreeTier `403`s the key's session is refreshed with a freshly minted one automatically (2 consecutive 403s trigger it, 1-minute per-key backoff); a sustained rise in the refresh rate in the logs is the tripwire that zen has tightened its gate.
 
 Sessions also **rotate on age**: a background rotator checks every key once a minute and re-mints any session older than `ZEN_SESSION_ROTATE_MINUTES` (default 120 = 2 h). An upstream session that has gone stale makes its first request noticeably slower even though the gateway still accepts it; a periodic local re-mint keeps that latency off the user's path. Rotation is free — the ID is minted locally, so nothing is sent upstream and no quota is consumed, and the rotator also pre-mints sessions for keys that have not been used yet (which is what keeps round-robin from collapsing onto a single key). Set the value to `0` to disable age-based rotation (missing sessions are still minted). The same interval is editable in the panel's opencode tab ("Session rotation (min)").
 
 The zen route table is seeded deterministically from the model catalog's SDK package name (`provider.npm`: `@ai-sdk/openai` → native `/v1/responses`, `@ai-sdk/openai-compatible` → `/chat/completions`) and refined per model by the endpoint learner, whose decisions persist in `.zen-endpoints.json` and are never overwritten by later catalog syncs.
+
+The upstream base URL is `https://opencode.ai/inference/v1` (the URL the current catalog gives the real CLI). The old `https://opencode.ai/zen/v1` still works for keyed traffic but rejects anonymous free-tier requests via a console shim that strips the validated headers, so a saved config pointing exactly at the legacy URL is migrated to the new one on load (custom URLs are left alone); the migration is logged as `zen baseURL migrated: …`.
 
 | Variable | Default | Description |
 |---|---|---|

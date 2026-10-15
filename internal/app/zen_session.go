@@ -297,7 +297,7 @@ func StickyZenIdentity(key string) (sess, req, ua string) {
 	if e.UA == "" {
 		e.UA = zenNativeUA
 	}
-	return e.Session, "msg_" + kit.RandAlphaNum(26), e.UA
+	return e.Session, kit.MintZenRequestID(), e.UA
 }
 
 // pruneZenKeyState 配置变更后清理已移除 key 的运行时状态（会话粘性 + 403 印记）。
@@ -375,11 +375,15 @@ func zenSessionFailed(key string) {
 
 // refreshZenSession 同步把该 key 的粘性会话换成本地铸造的新 ID（新会话、保留 UA）。
 // 幂等且零成本（无子进程、无额度消耗）：FreeTier 403 的调用点在本请求内至多调用
-// 一次，然后同 key 重试。key 为空/"public" 或无 key 配置时不动（哨兵无凭据）；
-// 已从配置移除的 key 也不重建——否则 pruneZenKeyState 刚清掉的条目会被这里复活，
-// 让 .zen-sessions.json 单调增长。
+// 一次，然后同 key 重试。key 为空或无 key 配置时不动；已从配置移除的 key
+// 也不重建——否则 pruneZenKeyState 刚清掉的条目会被这里复活，让
+// .zen-sessions.json 单调增长。
+//
+// "public" 不再豁免：2026-10-15 审计发现旧豁免让 keyless 池的 403 恢复成为
+// 空转——重试带着同一会话原样重发、必然再 403，且单 key 时 cooldown 返回 0
+// 不生效，故障对外完全静默。现在 public 与真实 key 同样换新会话再重试。
 func refreshZenSession(key string) {
-	if key == "" || key == "public" {
+	if key == "" {
 		return
 	}
 	if !zenKeyConfigured(key) {

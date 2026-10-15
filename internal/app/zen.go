@@ -68,7 +68,15 @@ var (
 	zenAliases  = make(map[string]*ZenModel) // 别名表
 )
 
-const zenAPIBase = "https://opencode.ai/zen/v1"
+// zenAPIBase 上游基地址。2026-10-15 实测：官方目录（models.opencode.ai）
+// 已把 opencode provider 的 api 指向 /inference/v1，CLI 直连新后端；旧
+// /zen/v1 经 console 中转后匿名免费请求恒 403 FreeTierError（中转剥
+// Authorization 并改名 x-opencode-request，校验无法通过），故默认与存量
+// 配置一并迁移到 /inference/v1（见 loadZenConfig 的迁移逻辑）。
+const zenAPIBase = "https://opencode.ai/inference/v1"
+
+// zenLegacyBase 已废弃的旧基地址，仅用于存量配置迁移识别。
+const zenLegacyBase = "https://opencode.ai/zen/v1"
 
 func initZenModels() {
 	zenModelsMu.Lock()
@@ -422,6 +430,12 @@ func loadZenConfig() *zenConfigData {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = zenAPIBase
 	}
+	// 存量配置迁移：旧默认 /zen/v1 对匿名免费层已失效（恒 403），
+	// 只迁移恰好等于旧默认值的配置；用户显式改过的其它地址不动。
+	if strings.TrimRight(cfg.BaseURL, "/") == zenLegacyBase {
+		cfg.BaseURL = zenAPIBase
+		log.Printf("zen baseURL migrated: %s -> %s (legacy zen endpoint rejects anonymous free-tier traffic)", zenLegacyBase, zenAPIBase)
+	}
 	return cfg
 }
 
@@ -756,11 +770,10 @@ func pinnedZenKey() string {
 // ============ zen 上游调用 ============
 
 // zenGateToolSpecs 免费层两个端点必须携带的 opencode 工具集（工具名与官方
-// CLI 一致）。FreeTier 中间件按工具名校验"请求是否来自 opencode CLI"
-// （2026-09-18 实测解码：缺工具/工具名不齐 → 403 FreeTierError，即使会话
-// 有效；乱序、假描述、仅核心 5 名(bash/edit/glob/grep/read)也通过）。
-// 描述用精简占位即可——工具注入后模型在 tool_choice=none（chat）或
-// 文本语义（responses）下不产生实质工具调用，回复保持纯文本。
+// CLI 一致）。校验规则 2026-10-15 在新 inference 后端重新实测：缺工具 →
+// 403；工具在但 parameters 为空 schema → 403；描述文本、tool_choice、UA
+// 均不参与校验。注入的定义（描述+schema）统一取 zen_gate_tools.go 的官方
+// CLI 1.19.0 原文，本表只保留名字与精简描述作兜底/名录用途。
 // 单一来源：改名/增删必须同时满足两个端点的校验，只改这里。
 var zenGateToolSpecs = []struct{ name, desc string }{
 	{"bash", "Execute a bash command"},
@@ -778,8 +791,24 @@ var zenGateToolSpecs = []struct{ name, desc string }{
 
 // zenGateTools chat 端点形态：tools[].{type,function:{name,description,parameters}}。
 // 返回 []any 与客户端解码出来的 tools 同型（下游要拼接两者）。
+// parameters 必须是官方真实 schema（空 schema 会被新后端 403，见
+// zen_gate_tools.go）；嵌入定义缺失时才退回精简描述+空 schema 兜底。
 func zenGateTools() []any {
+	defs := zenGateToolDefs()
 	out := make([]any, 0, len(zenGateToolSpecs))
+	if len(defs) > 0 {
+		for _, d := range defs {
+			out = append(out, map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        d.Name,
+					"description": d.Description,
+					"parameters":  d.ParametersChat,
+				},
+			})
+		}
+		return out
+	}
 	for _, s := range zenGateToolSpecs {
 		out = append(out, map[string]any{
 			"type": "function",
@@ -1172,11 +1201,17 @@ func zenMergeResponsesTools(clientTools []map[string]any) []any {
 			continue
 		}
 		provided[s.name] = true
+		// parameters 必须用 responses 形态的官方真实 schema：空 schema
+		// 会被新后端 403（2026-10-15 实测，见 zen_gate_tools.go）。
+		desc, params := s.desc, zenEmptySchema()
+		if d := lookupZenGateToolDef(s.name); d != nil {
+			desc, params = d.Description, d.ParametersResponses
+		}
 		merged = append(merged, map[string]any{
 			"type":        "function",
 			"name":        s.name,
-			"description": s.desc,
-			"parameters":  zenEmptySchema(),
+			"description": desc,
+			"parameters":  params,
 			"strict":      false,
 		})
 	}

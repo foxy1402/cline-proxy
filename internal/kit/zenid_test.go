@@ -94,11 +94,36 @@ func TestFreshZenIdentityMintsValidSession(t *testing.T) {
 		if !ValidZenSessionID(sess) {
 			t.Fatalf("ValidZenSessionID rejected a freshly minted session: %q", sess)
 		}
-		if !strings.HasPrefix(req, "msg_") || len(req) != 30 {
-			t.Fatalf("request id malformed: %q", req)
+		if !ValidZenRequestID(req) {
+			t.Fatalf("request id not gate-valid: %q", req)
 		}
 		if ua == "" {
 			t.Fatal("user-agent must not be empty")
 		}
+	}
+}
+
+// 2026-10-15 回归：新后端对 x-opencode-request 同样执行
+// ^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$ 格式门。旧实现 "msg_"+RandAlphaNum(26)
+// 头 12 位几乎必含非 hex 字符 → 全量 403。铸造的请求 ID 必须恒合法且唯一。
+func TestMintZenRequestIDFormat(t *testing.T) {
+	re := regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+	seen := make(map[string]bool, 1000)
+	for i := 0; i < 1000; i++ {
+		id := MintZenRequestID()
+		if !re.MatchString(id) {
+			t.Fatalf("request id not gate-valid: %q", id)
+		}
+		if !ValidZenRequestID(id) {
+			t.Fatalf("ValidZenRequestID rejected a freshly minted id: %q", id)
+		}
+		if seen[id] {
+			t.Fatalf("duplicate request id: %q", id)
+		}
+		seen[id] = true
+	}
+	// 反例：旧式纯随机 ID 不得被判合法（混入非 hex 头是常态而非例外）。
+	if ValidZenRequestID("msg_" + "z" + strings.Repeat("a", 25)) {
+		t.Fatal("ValidZenRequestID accepted a non-hex head")
 	}
 }

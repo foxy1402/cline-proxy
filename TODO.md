@@ -1,5 +1,46 @@
 # TODO — Public container deployment: stateless /v1 proxy with multi-account rotation
 
+## zen gateway upgrade broke FreeTier auth — three rules, all verified live (2026-10-15)
+
+opencode zen changed its gateway; every zen request started returning `403
+FreeTierError`. An external audit proposed a patch (`cline-proxy-zen-403.patch`);
+I verified each claim independently by A/B bisection against the live upstream
+(repo's own TLS fingerprint + gate headers, one variable at a time) before
+accepting it. All three root causes confirmed:
+
+1. **`x-opencode-request` is format-checked.** Must match
+   `^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`. Old code sent `"msg_"+RandAlphaNum(26)`
+   — the head is random alphanumerics, so it was almost never all-hex. Probe:
+   good id → 200, random id → 403. Fix: `kit.MintZenRequestID`, sharing the
+   descending minter with `MintZenSessionID`.
+2. **Gate tools need real parameter schemas.** An empty
+   `{"type":"object","properties":{}}` is rejected on both the chat and
+   responses paths. Probe isolation proved it is the *schema* that is checked,
+   not the description: real schema + 1-char description → 200; empty schema +
+   real long description → 403; no tools at all → 403. Fix: embed the opencode
+   CLI 1.19.0 tool definitions (`zen_gate_tools.{go,json}`), keeping the
+   chat-form (with `$schema`, min/max) and responses-form (stripped) variants.
+3. **Anonymous traffic must use `/inference/v1`.** For keyed traffic both bases
+   work, but `key = "public"` on the legacy `/zen/v1` shim 403s (the shim strips
+   `authorization` and rewrites `x-opencode-request`). Probe: anon `/zen/v1` →
+   403, anon `/inference/v1` → 200. Fix: default base + migrate a saved config
+   that equals exactly the legacy URL.
+
+Proven irrelevant (left alone, contrary to first instincts): the stale UA string,
+`tool_choice`, TLS fingerprint, header order, message contents.
+
+Also fixed from the same audit: `refreshZenSession` no longer skips `key ==
+"public"` — that exemption made the keyless-pool 403 retry byte-identical and
+therefore a silent no-op.
+
+Verified end-to-end on the built image (docker). A/B with an identical legacy
+config: unpatched 403s on both endpoints; patched returns chat `"4"`, responses
+`"8"`, real `tool_calls`/`function_call` for two models streaming and
+non-streaming, `read({"filePath":"/etc/hosts"})` for IDE-named tools on
+`/responses`, and 9/12 zen models answering a plain prompt (the 3 misses are
+cline-side models needing accounts, or a transient upstream 503 — not this bug).
+The `zen baseURL migrated:` line appears on first boot with an old config.
+
 ## Zen session rotation was lazy-only; fixed with a background rotator (2026-10-10)
 
 Reported bug: zen sessions did not rotate after the interval unless you clicked

@@ -72,11 +72,12 @@ func RandIntn(n int) int {
 // session 走本地铸造（MintZenSessionID），与粘性路径同款合法格式
 // ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$ —— 匿名路径命中同一道免费门，旧实现
 // 的 "sess_"+26 随机串格式不符，必然 403 FreeTierError。
-// request 为 msg_<26 字母数字>（与官方 msg_ 前缀一致）。UA 仍每次轮换
-// （匿名路径本就模拟多客户端）。
+// request 走本地铸造（MintZenRequestID）——2026-10-15 实测新后端对
+// x-opencode-request 同样执行 ^msg_[0-9a-f]{12} 格式门，纯随机串必 403。
+// UA 仍每次轮换（匿名路径本就模拟多客户端）。
 func FreshZenIdentity() (string, string, string) {
 	return MintZenSessionID(),
-		"msg_" + RandAlphaNum(26),
+		MintZenRequestID(),
 		ZenUserAgents[RandIntn(len(ZenUserAgents))]
 }
 

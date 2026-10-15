@@ -574,7 +574,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       </table>
     </div>
     <div class="form-row">
-      <div class="field"><label>Base URL</label><input type="text" id="ocBaseURL" placeholder="https://opencode.ai/zen/v1"></div>
+      <div class="field"><label>Base URL</label><input type="text" id="ocBaseURL" placeholder="https://opencode.ai/inference/v1"></div>
       <div class="field">
         <label>Egress proxies</label>
         <div class="hint" style="margin-top:6px" id="ocProxyState">-</div>
