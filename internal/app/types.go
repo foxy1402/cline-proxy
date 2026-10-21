@@ -23,6 +23,11 @@ type Account struct {
 	CreatedAt       time.Time `json:"createdAt"`
 	CooldownUntil   time.Time `json:"cooldownUntil,omitempty"` // 预计冷却结束时间
 	LastReason      string    `json:"lastReason,omitempty"`    // 最后一次进入冷却/失效的原因
+	// EgressProxy / NoEgress 仅供管理面板展示：该账号绑定的出口（已打码），
+	// 或"代理池已用尽、本账号在代理模式下被跳过"。绑定本身持久化在
+	// .egress-bindings.json，不进账号池文件。
+	EgressProxy string `json:"egressProxy,omitempty"`
+	NoEgress    bool   `json:"noEgress,omitempty"`
 }
 
 type AccountPool struct {

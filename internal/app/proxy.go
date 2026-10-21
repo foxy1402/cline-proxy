@@ -84,6 +84,10 @@ func StartProxy(host string, port int) error {
 	startZenSessionRotator()
 	startPoolFlusher()
 	loadZenEndpoints()
+	// 出口绑定必须在首次请求之前就位：否则第一批请求会用轮转出来的
+	// 出口发出，恰好是上游记录 IP 的那一刻。
+	loadEgressBindings()
+	reconcileEgressBindings()
 	loadClineStreamLearned()
 	initStats()
 	LoadRequestLogsFromFile()
@@ -1010,7 +1014,8 @@ var clineAPIBase = cline.ClineAPIBase
 
 // callClineAPI 调用 cline 上游，带跨账号 failover。
 // ctx 来自客户端请求: IDE abort/取消时立即终止,不冷却账号。
-// useProxies 为 true 时走出口代理池（每次尝试 round-robin 挑选）;
+// useProxies 为 true 时走出口代理池；绑定策略生效时每个账号固定一个出口
+// （egress.go，与 zen key 同一套规则），否则每次尝试按请求轮转。
 // 代理路径上的网络错误只冷却代理本身,绝不冷却账号 —— 代理故障不污染账号池。
 //
 // failover（P2 修复）：429/5xx 时换下一个账号重试（至多 clineFailoverAttempts
@@ -1023,11 +1028,17 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 	var lastAcc *Account
 	tried := map[string]bool{}
 	for i := 0; i < clineFailoverAttempts; i++ {
-		acc := pickAccountExcluding(tried)
+		acc := pickAccountExcluding(tried, useProxies)
 		if acc == nil {
 			if lastErr != nil {
 				// 所有可用账号都试过了：返回最后一次的真实错误（比"无账号"更有信息量）
 				return nil, lastAcc, lastErr
+			}
+			// 绑定策略下"没有可用账号"通常是代理不够：明确说出来，
+			// 否则用户只看到 "no active accounts" 而池子里其实有 11 个。
+			if useProxies && egressBindingActive() {
+				return nil, nil, fmt.Errorf("no account has an egress proxy assigned: %w",
+					egressShortfallError("cline", egressNSCline, poolAccountIDs()))
 			}
 			return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
 		}
@@ -1102,7 +1113,15 @@ func clineAPIWithAccount(ctx context.Context, params map[string]any, stream bool
 	for i := 0; i < attempts; i++ {
 		proxyURL, pidx := "", -1
 		if useProxies {
-			proxyURL, pidx = pickUpstreamProxy()
+			// 绑定策略下该账号固定一个出口：同一账号从多个 IP 出去正是
+			// 上游用来判定"同一个人多账号"的指纹。
+			if egressBindingActive() {
+				if p, ok := egressProxyForCline(acc.AccountID); ok {
+					proxyURL, pidx = p, proxyIndex(p)
+				}
+			} else {
+				proxyURL, pidx = pickUpstreamProxy()
+			}
 			client = proxyClientFor(proxyURL)
 			log.Printf("  cline upstream via %s", maskProxyURL(proxyURL))
 		}

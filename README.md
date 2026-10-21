@@ -11,7 +11,7 @@ Cursor / ZCode / Cline / Claude Code ──►  cline-proxy  ──►  cline ac
    /v1/chat/completions                        │
    /v1/messages (Anthropic)                    ├─►  opencode zen free models (multi-key, proxy pool)
    /v1/responses (OpenAI Responses)            │
-   /v1/models                                  └─►  egress socks5/http proxy pool (per-request rotation)
+   /v1/models                                  └─►  egress socks5/http proxy pool (one proxy pinned per key/account)
 ```
 
 - **One endpoint, both upstreams.** The gateway inspects the requested `model` and routes it: zen free models (`big-pickle`, `mimo-v2.6-flash-free`, `nemotron-3-ultra-free`, …) go to opencode zen, paid zen models are rejected with a clear 400, everything else goes to the Cline account pool. Combos let you define your own alias model IDs on either platform.
@@ -98,7 +98,7 @@ To seed Cline accounts on first boot, drop a `cline-seed.json` file into the vol
 
 ## Configuration
 
-All state lives in the `/app/data` volume — dotfiles written `0600`: `.cline-accounts.json` (account pool), `.zen-config.json` (zen keys/settings), `.zen-sessions.json` (per-key sticky session IDs), `.zen-endpoints.json` (learned chat-vs-responses routes), `.zen-model-aliases.json` (410 deprecation remaps), `.session-secret`, plus `combos.json`, `requests.jsonl`, `zen-stats.jsonl` and `cline-proxy.log`. Backup = copy the volume.
+All state lives in the `/app/data` volume — dotfiles written `0600`: `.cline-accounts.json` (account pool), `.zen-config.json` (zen keys/settings), `.zen-sessions.json` (per-key sticky session IDs), `.zen-endpoints.json` (learned chat-vs-responses routes), `.zen-model-aliases.json` (410 deprecation remaps), `.egress-bindings.json` (key/account → egress proxy, hashed keys), `.session-secret`, plus `combos.json`, `requests.jsonl`, `zen-stats.jsonl` and `cline-proxy.log`. Backup = copy the volume.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -141,6 +141,18 @@ The upstream base URL is `https://opencode.ai/inference/v1` (the URL the current
 |---|---|---|
 | `ZEN_PIN_KEY` | empty | Troubleshooting: pin all upstream attempts to key number *n* (1-based) instead of rotating, so one key can be tested in isolation |
 | `ZEN_SESSION_ROTATE_MINUTES` | `120` | Re-mint a key's sticky session once it is this old (minutes); `0` disables rotation (also editable in the panel) |
+
+### One egress proxy per key
+
+opencode zen now records the egress IP per api key and flags a key seen from several IPs as suspicious — with pure round-robin every key cycles through the whole proxy pool, so the whole pool gets marked even when the proxies themselves are clean. The gateway therefore **pins one proxy per identity**:
+
+- each zen key is assigned one proxy and always leaves through it; a proxy serves one identity at a time
+- if there are fewer proxies than keys, the surplus keys are **skipped** rather than sent direct or borrowing another key's exit (either would reintroduce the "one key, many IPs" fingerprint) — the request fails with an explicit capacity error, and the panel marks those keys `no egress`
+- the assignment persists in `.egress-bindings.json`, so a restart does not reshuffle it (a reshuffle is exactly the IP change that triggered the flag). zen keys are stored as a truncated sha256, so the file holds no plaintext credentials
+- adding a proxy gives it to the next unassigned key; removing a proxy unbinds its keys instead of silently moving them
+- zen and cline are separate namespaces: the same proxy may serve one zen key **and** one cline account, since each upstream only ever sees one identity behind it
+
+Cline accounts get the same treatment whenever the cline pool uses proxies (`CLINE_USE_PROXIES` or the panel switch), so the rule is already in place if cline adopts it. The switch is **Pin one egress proxy per key** on the opencode tab (default on; also stored as `pinProxyPerKey` in `.zen-config.json`). With no proxies configured the binding is inert and traffic goes direct, as before.
 
 The admin panel's opencode tab shows per-key session liveness, age and next rotation, plus a per-key **Test** button with a probe-model picker (default **auto**: big-pickle first, then live-synced models; any free zen model can be chosen): it sends one real probe request pinned to that key, and on success clears the key's cooldown immediately (a rate-limited answer — 429, or a 403/503 whose body zen words as a limit — reports the upstream's expected recovery time instead). Note a successful probe consumes one request of that key's quota — the same trade-off as the cline Test button.
 

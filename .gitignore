@@ -16,6 +16,7 @@ cline-proxy-*
 .zen-config.json
 .zen-sessions.json
 .zen-endpoints.json
+.egress-bindings.json
 .cline-stream-required.json
 zen-stats.jsonl
 cline-proxy.log

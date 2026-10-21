@@ -293,10 +293,10 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>Email</th><th>Status</th><th title="Counted locally by this proxy — not the official free quota">Today/Total tokens</th><th>Last used</th><th>Created</th><th>Actions</th></tr>
+        <tr><th>Email</th><th>Status</th><th title="Counted locally by this proxy — not the official free quota">Today/Total tokens</th><th title="Egress proxy pinned to this account (one account, one IP)">Egress</th><th>Last used</th><th>Created</th><th>Actions</th></tr>
       </thead>
       <tbody id="accountTableBody">
-        <tr><td colspan="6" class="empty">Loading...</td></tr>
+        <tr><td colspan="7" class="empty">Loading...</td></tr>
       </tbody>
     </table>
     </div>
@@ -403,6 +403,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
         <div class="hint">Zen automatically routes through the pool above whenever the list is non-empty — no separate switch needed.</div>
       </div>
     </div>
+    <div class="hint" id="ppEgressInfo" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">-</div>
   </div>
 </div>
 <div class="section">
@@ -567,10 +568,17 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <input type="text" id="ocSessionRotate" placeholder="120" style="max-width:90px" title="Mint a fresh session id for a key once it is this old. 0 = never rotate (a long-lived session makes the first request slow after a few days).">
     </div>
     <p class="hint" style="margin-top:0">Per-key session state is shown in the table below. Session IDs are minted locally and match the upstream's format gate (<code>^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$</code>) — no CLI or harvester involved. On repeated FreeTier 403s, or once a session is older than the rotation interval, a key's session is refreshed with a freshly minted one automatically.</p>
+    <div class="form-row">
+      <div class="field"><label>Pin one egress proxy per key</label>
+        <select id="ocPinProxy"><option value="true">On — one key, one exit IP</option><option value="false">Off — rotate per request</option></select>
+      </div>
+      <div class="field"><label>Egress capacity</label><span id="ocEgressInfo" class="stat-mini" style="align-self:center">-</span></div>
+    </div>
+    <p class="hint" style="margin-top:0">opencode zen records the egress IP per key and treats a key seen from several IPs as suspicious, so each key is pinned to one proxy by default, and keys that got no proxy are skipped — they would otherwise leak an extra IP. One proxy serves one identity per upstream; Cline accounts get the same treatment when the Cline pool uses proxies. Turn this off only for troubleshooting.</p>
     <div class="table-wrap" style="margin-bottom:10px">
       <table>
-        <thead><tr><th style="width:44px">#</th><th style="width:100px">Key</th><th style="width:60px">Usage</th><th style="width:170px">Session</th><th style="width:110px">Rotates</th><th>Cooldown</th><th style="width:84px"></th></tr></thead>
-        <tbody id="ocKeysBody"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody>
+        <thead><tr><th style="width:44px">#</th><th style="width:100px">Key</th><th style="width:60px">Usage</th><th style="width:150px">Egress</th><th style="width:160px">Session</th><th style="width:110px">Rotates</th><th>Cooldown</th><th style="width:84px"></th></tr></thead>
+        <tbody id="ocKeysBody"><tr><td colspan="8" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
     <div class="form-row">
@@ -784,7 +792,7 @@ async function loadAccounts() {
     const list = d.data.accounts;
     const tbody = _('accountTableBody');
     if (!list || list.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">No accounts yet — add one on the <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">Add accounts</a> page</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No accounts yet — add one on the <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">Add accounts</a> page</td></tr>';
       return;
     }
     const sn = { active: 'Active', cooldown: 'Cooldown', expired: 'Expired' };
@@ -798,10 +806,19 @@ async function loadAccounts() {
         statusExtra = until ? '<div style="font-size:10px;color:var(--text3);margin-top:2px">Recovers ' + esc(until) + '</div>' : '';
       }
       const st = esc(a.status);
+      // 出口列：cline 走代理池时每个账号固定一个出口；未分到代理的账号
+      // 在代理模式下不会被选中（面板要能解释原因）。
+      let eg = '<span style="color:var(--text2)">-</span>';
+      if (a.egressProxy) {
+        eg = '<span class="mono" style="font-size:11px">' + esc(a.egressProxy) + '</span>';
+      } else if (a.noEgress) {
+        eg = '<span style="color:var(--danger)" title="No proxy left after one-per-account assignment — this account is skipped while the pool is in use">no egress</span>';
+      }
       return '<tr>' +
         '<td>' + esc(a.email) + '</td>' +
         '<td><span class="status ' + st + '"><span class="status-dot ' + st + '"></span>' + (sn[a.status] || st) + '</span>' + statusExtra + '</td>' +
           '<td title="Today ' + fmtNum(a.tokensToday) + ' / total ' + fmtNum(a.tokensTotal) + ' tokens (exact when upstream returns usage, otherwise estimated)">' + fmtTokens(a.tokensToday) + ' / ' + fmtTokens(a.tokensTotal) + '</td>' +
+        '<td>' + eg + '</td>' +
         '<td class="mono" style="font-size:11px">' + lu + '</td>' +
         '<td class="mono" style="font-size:11px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
@@ -1295,6 +1312,19 @@ async function loadOcConfig() {
     _('ocFailoverCount').value = c.failoverCount || 3;
     _('ocFailoverMinutes').value = c.failoverMinutes || 5;
     if (_('ocSessionRotate')) _('ocSessionRotate').value = (c.sessionRotateMinutes != null ? c.sessionRotateMinutes : 120);
+    if (_('ocPinProxy')) _('ocPinProxy').value = String(c.pinProxyPerKey !== false);
+    const eg = c.egress || {};
+    if (_('ocEgressInfo')) {
+      const un = eg.unassigned || 0;
+      _('ocEgressInfo').innerHTML = !eg.enabled
+        ? '<span style="color:var(--text2)">disabled — per-request rotation</span>'
+        : (!eg.active
+            ? '<span style="color:var(--text2)">no proxies — direct</span>'
+            : '<span style="color:' + (un > 0 ? 'var(--danger)' : 'var(--accent2)') + '">' +
+              (eg.proxies || 0) + ' prox' + ((eg.proxies || 0) === 1 ? 'y' : 'ies') + ' · ' +
+              (eg.assigned || 0) + '/' + (eg.identities || 0) + ' keys bound' +
+              (un > 0 ? ' · ' + un + ' key' + (un === 1 ? '' : 's') + ' skipped' : '') + '</span>');
+    }
     _('ocCompactAuto').value = String(c.compaction ? c.compaction.auto : true);
     _('ocCompactBuffer').value = c.compaction ? c.compaction.buffer : 20000;
     _('ocKeepTokens').value = c.compaction ? c.compaction.keepTokens : 8000;
@@ -1325,6 +1355,7 @@ async function saveOcConfig() {
     failoverCount: parseInt(_('ocFailoverCount').value) || 3,
     failoverMinutes: parseInt(_('ocFailoverMinutes').value) || 5,
     sessionRotateMinutes: rot,
+    pinProxyPerKey: _('ocPinProxy') ? _('ocPinProxy').value === 'true' : true,
     compaction: {
       auto: _('ocCompactAuto').value === 'true',
       buffer: parseInt(_('ocCompactBuffer').value) || 20000,
@@ -1365,15 +1396,26 @@ function renderOcKeyStates(ks) {
         const cool = k.cooling
           ? '<span style="color:var(--danger)">cooling' + (k.cooldownUntil ? ' · until ' + esc(fmtWhen(k.cooldownUntil)) : '') + '</span>'
           : '<span style="color:var(--text2)">-</span>';
+        // 出口：绑定策略下没分到代理的 key 不会参与轮转（面板要能解释
+        // "为什么这个 key 一直 0 用量"）。
+        let eg = '<span style="color:var(--text2)">rotating</span>';
+        if (k.noEgress) {
+          eg = '<span style="color:var(--danger)" title="No proxy left after one-per-key assignment — this key is skipped until you add proxies">no egress</span>';
+        } else if (k.proxy && k.proxy !== 'rotating (no key)') {
+          eg = '<span class="mono" style="font-size:11px" title="exit #' + (k.proxyIndex >= 0 ? k.proxyIndex + 1 : '?') + '">' + esc(k.proxy) + '</span>';
+        } else if (k.proxy === 'rotating (no key)') {
+          eg = '<span style="color:var(--text2)" title="anonymous requests have no key to bind">rotating</span>';
+        }
         return '<tr><td>#' + (k.index + 1) + (k.current ? ' <span style="color:var(--accent)" title="next in rotation">●</span>' : '') + '</td>' +
           '<td style="font-family:monospace;font-size:11px">' + esc(k.keyMask) + '</td>' +
           '<td>' + (k.usage || 0) + '</td>' +
+          '<td>' + eg + '</td>' +
           '<td>' + sess + '</td>' +
           '<td>' + rot + '</td>' +
           '<td>' + cool + '</td>' +
           '<td>' + (k.keyMask === 'public (no key)' ? '' : '<button class="btn btn-sm" data-zk="' + k.index + '">Test</button>') + '</td></tr>';
       }).join('')
-    : '<tr><td colspan="7" class="empty">No zen keys configured</td></tr>';
+    : '<tr><td colspan="8" class="empty">No zen keys configured</td></tr>';
   tb.onclick = e => {
     const b = e.target.closest('button[data-zk]');
     if (b) testZenKey(parseInt(b.dataset.zk, 10), b);
@@ -1420,6 +1462,17 @@ async function loadProxyPool() {
           ? '<span style="color:var(--accent2)">routing through the pool</span>'
           : '<span style="color:var(--text2)">direct (pool list is empty)</span>')
       : '<span style="color:var(--text2)">upstream disabled</span>';
+    const eg = c.egress || {};
+    if (_('ppEgressInfo')) {
+      _('ppEgressInfo').innerHTML = !eg.enabled
+        ? '<span style="color:var(--text2)">Per-key pinning is off (opencode tab) — proxies rotate per request.</span>'
+        : (!eg.active
+            ? '<span style="color:var(--text2)">Per-key pinning is on, but the proxy list is empty — traffic goes direct.</span>'
+            : '<span style="color:' + ((eg.unassigned || 0) > 0 ? 'var(--danger)' : 'var(--accent2)') + '">' +
+              'One proxy per key: ' + (eg.assigned || 0) + '/' + (eg.identities || 0) + ' zen key(s) bound' +
+              ((eg.unassigned || 0) > 0 ? ' — ' + eg.unassigned + ' key(s) skipped because there are only ' + (eg.proxies || 0) + ' proxies' : '') +
+              '.</span>');
+    }
     const cd = (c.runtime || {}).proxyCooldowns || {};
     const keys = Object.keys(cd);
     _('ppCooldownInfo').textContent = keys.length

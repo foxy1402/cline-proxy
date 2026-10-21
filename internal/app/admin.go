@@ -141,6 +141,18 @@ func handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accounts := ListAccounts()
+	// 出口绑定（与 zen key 同一套规则）：cline 走代理池时每个账号固定一个
+	// 出口，没有分到代理的账号会被 pickAccountExcluding 跳过。面板必须能
+	// 看出原因，否则只会看到"账号都在却选不到"。
+	if clineProxiesEnabled() && egressBindingActive() {
+		for _, a := range accounts {
+			if p, ok := egressProxyForCline(a.AccountID); ok {
+				a.EgressProxy = maskProxyURL(p)
+			} else {
+				a.NoEgress = true
+			}
+		}
+	}
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Data: map[string]any{

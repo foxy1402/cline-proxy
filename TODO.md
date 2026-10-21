@@ -1,5 +1,41 @@
 # TODO — Public container deployment: stateless /v1 proxy with multi-account rotation
 
+## zen now caps one IP per key — egress is pinned per identity (2026-10-21)
+
+Reported: zen now allows one personal IP per api key. With round-robin egress
+every key cycled through every proxy, so zen marked **all** keys suspicious even
+though the proxies were clean.
+
+Fix: a key is bound to one proxy for its whole life, instead of a proxy being
+chosen per request.
+
+- `.egress-bindings.json` (0600, tmp+rename) holds `identity -> proxy`; zen keys
+  are stored as the first 8 bytes of sha256 in hex, so the file has no plaintext
+  credentials and is safe to paste into an issue.
+- Assignment is stable: reconcile is idempotent and existing bindings are kept as
+  long as their proxy stays in the pool. A restart does not reshuffle — a
+  reshuffle is precisely the IP change that triggered the flag.
+- Fewer proxies than keys: the surplus keys are **filtered out** of
+  `pickZenKey` / `pickAccountExcluding` and the request fails with an explicit
+  capacity error naming the numbers. They are never sent direct and never borrow
+  another key's exit — either would recreate the "one key, many IPs" fingerprint.
+- Removing a proxy unbinds its keys rather than silently moving them.
+- zen and cline are independent namespaces: one proxy can serve one zen key and
+  one cline account, since each upstream sees only its own identity.
+- Applies to cline too (when the cline pool uses proxies), so the rule is already
+  in place if cline adopts the same policy.
+- Switch: **Pin one egress proxy per key** (opencode tab, default on,
+  `pinProxyPerKey` in `.zen-config.json`). Off = old per-request rotation. With
+  no proxies the binding is inert and traffic is direct, so a default install is
+  unaffected.
+
+Verified by unit tests (assignment, stability across reconcile, overflow
+filtering, proxy removal, persistence without plaintext, namespace independence,
+legacy-config default) and end-to-end against a fake upstream behind two local
+CONNECT proxies: 8 requests, key#1 only ever on :56201 and key#2 only ever on
+:56202; with 3 keys and 2 proxies key#3 was never used; a restart reused the same
+two exits.
+
 ## zen gateway upgrade broke FreeTier auth — three rules, all verified live (2026-10-15)
 
 opencode zen changed its gateway; every zen request started returning `403

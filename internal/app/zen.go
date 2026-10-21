@@ -259,6 +259,10 @@ type zenConfigData struct {
 	// SessionRotateMinutes 粘性会话本地轮换周期（分钟），默认 120（2 小时）。
 	// 0 = 永不轮换（沿用旧行为，长跑后首个请求会因会话老化而变慢）。
 	SessionRotateMinutes int `json:"sessionRotateMinutes"`
+	// PinProxyPerKey 每个 key/账号固定一个出口代理（默认 true）。指针类型：
+	// nil = 旧配置文件没有该键 → 按默认开启处理（见 pinProxyPerKeyEnabled）。
+	// 关闭后恢复按请求轮转（zen 按 key 的 IP 指纹会重新出现，仅排障用）。
+	PinProxyPerKey *bool `json:"pinProxyPerKey,omitempty"`
 }
 
 func defaultZenConfig() *zenConfigData {
@@ -276,6 +280,9 @@ func defaultZenConfig() *zenConfigData {
 		// 会话轮换周期：缺少该键的旧配置文件保持此默认（2 小时）。
 		// 显式写 0 表示关闭轮换（见 SessionRotateMinutes 注释）。
 		SessionRotateMinutes: defaultSessionRotateMinutes,
+		// 每 key 固定出口：2026-10-21 起 zen 按 key 记录出口 IP，轮转会
+		// 让整池 key 被判可疑，故默认开启（无代理时自动退回直连）。
+		PinProxyPerKey: boolPtr(true),
 		Compaction: zenCompactConfig{
 			Auto:       true,
 			Buffer:     20000,
@@ -516,6 +523,9 @@ func setZenConfig(c *zenConfigData) {
 		}
 	}
 	proxyClientCacheMu.Unlock()
+	// key/账号/代理列表任一变化都要重算出口绑定：新 key 分配空闲代理、
+	// 被移除的 key 释放代理、代理被删则相关 key 变回"无出口"（从而被过滤）。
+	reconcileEgressBindings()
 }
 
 // proxiesChanged 按顺序比较两个代理列表是否不同（数量或任一位置变化都算）。
@@ -582,14 +592,31 @@ var (
 )
 
 // pickZenKey round-robin 选取一个未冷却的 key；全部冷却时按轮转顺序返回下一个。
-// 返回 "" 表示当前没有配置任何 key。
+// 返回 "" 表示当前没有配置任何 key，或（绑定策略生效时）没有任何 key 分到了
+// 出口代理——后者由调用方转成明确的容量错误，绝不退回直连或匿名。
+//
+// 绑定策略（egress.go）：一个 key 固定一个出口代理。代理数少于 key 数时，
+// 多出来的 key 没有出口，必须被过滤掉——它们的流量若继续发出（直连或借用
+// 别人的出口），上游就会把"一个 key 多个 IP"的指纹重新打上，这正是要消除的。
+// "public"（无凭据的匿名哨兵）不受约束：没有 key 可关联，出口随便轮转。
 func pickZenKey() string {
 	keys := getZenConfig().Keys
 	if len(keys) == 0 {
 		return ""
 	}
-	// 先取 live 会话集合（zenSessMu）再进 zenKeyMu：两把锁不嵌套，避免与
-	// 会话换新路径（持 zenSessMu 时不取 zenKeyMu，反之亦然）形成锁序反转。
+	// 先取绑定快照（egressMu），再取 live 会话集合（zenSessMu），最后进
+	// zenKeyMu：三把锁不嵌套，避免与换新路径形成锁序反转。
+	var bound map[string]bool
+	if egressBindingActive() {
+		bound = make(map[string]bool, len(keys))
+		for _, k := range keys {
+			if k == "public" {
+				bound[k] = true
+				continue
+			}
+			_, bound[k] = egressProxyForZen(k)
+		}
+	}
 	live := zenLiveKeys(keys)
 	zenKeyMu.Lock()
 	defer zenKeyMu.Unlock()
@@ -600,12 +627,13 @@ func pickZenKey() string {
 			delete(zenKeyCool, k)
 		}
 	}
+	eligible := func(k string) bool { return bound == nil || bound[k] }
 	// 第一轮：非冷却 + 有 live 会话。本地铸造后所有 key 生而有合法会话，
 	// 此轮几乎总是命中；仅在文件加载失败等异常时退化到第二轮。
 	for i := 0; i < len(keys); i++ {
 		idx := (zenKeyIdx + i) % len(keys)
 		k := keys[idx]
-		if _, cooling := zenKeyCool[k]; !cooling && live[k] {
+		if _, cooling := zenKeyCool[k]; !cooling && live[k] && eligible(k) {
 			zenKeyIdx = (idx + 1) % len(keys)
 			return k
 		}
@@ -615,15 +643,22 @@ func pickZenKey() string {
 	for i := 0; i < len(keys); i++ {
 		idx := (zenKeyIdx + i) % len(keys)
 		k := keys[idx]
-		if _, cooling := zenKeyCool[k]; !cooling {
+		if _, cooling := zenKeyCool[k]; !cooling && eligible(k) {
 			zenKeyIdx = (idx + 1) % len(keys)
 			return k
 		}
 	}
-	// 全部冷却中：仍按轮转返回（保持请求流动，上游会再次限流）
-	k := keys[zenKeyIdx%len(keys)]
-	zenKeyIdx = (zenKeyIdx + 1) % len(keys)
-	return k
+	// 全部冷却中：仍按轮转返回（保持请求流动，上游会再次限流）。
+	// 绑定过滤仍然生效——没出口的 key 连"冷却重试"都不该发出去。
+	for i := 0; i < len(keys); i++ {
+		idx := (zenKeyIdx + i) % len(keys)
+		k := keys[idx]
+		if eligible(k) {
+			zenKeyIdx = (idx + 1) % len(keys)
+			return k
+		}
+	}
+	return ""
 }
 
 // markZenKeySuccess 在上游 200 后累计 key 的成功调用数（仅内存态，面板展示用）。
@@ -715,6 +750,8 @@ func zenKeyStatus() []map[string]any {
 	for i, k := range keys {
 		sess[i] = zenSessionSnapshotOf(k)
 	}
+	// 出口绑定同样先快照：egress 路径取 zenConfigMu/egressMu，不能与 zenKeyMu 嵌套。
+	egress := zenEgressSnapshotOf(keys)
 	zenKeyMu.Lock()
 	defer zenKeyMu.Unlock()
 	now := time.Now()
@@ -733,6 +770,18 @@ func zenKeyStatus() []map[string]any {
 		}
 		if sess[i].CreatedAt > 0 {
 			st["sessionCreatedAt"] = time.Unix(sess[i].CreatedAt, 0).Format(time.RFC3339)
+		}
+		// 出口绑定：面板必须能看出"这个 key 为什么不在轮转里"。
+		// 没有绑定的 key 在绑定策略下等于停用（见 pickZenKey）。
+		// 快照已在进 zenKeyMu 之前算好（egress.go 的锁不与 zenKeyMu 嵌套）。
+		if e := egress[i]; e.proxy != "" {
+			st["proxy"] = maskProxyURL(e.proxy)
+			st["proxyIndex"] = e.index
+		} else if k == "public" {
+			st["proxy"] = "rotating (no key)"
+		} else if e.bound {
+			st["proxy"] = ""
+			st["noEgress"] = true
 		}
 		if until, cooling := zenKeyCool[k]; cooling && now.Before(until) {
 			st["cooling"] = true
@@ -1677,11 +1726,6 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
 
 	for attempt := 0; ; attempt++ {
-		proxyURL, pidx := pickUpstreamProxy()
-		viaProxy := "direct"
-		if proxyURL != "" {
-			viaProxy = maskProxyURL(proxyURL)
-		}
 		// 先选 key：attempt==0 或尚无粘性 key 时轮转；重试链内沿用
 		// retryKey（会话绑定要求 key 与 sess_ 一致；换 key 由下方
 		// 限流/403 分支显式改写 retryKey 后 continue 实现）。
@@ -1699,6 +1743,23 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 			retryKey = pickZenKey()
 		}
 		key = retryKey
+		// 绑定策略下"没有可用 key"只可能是一个原因：代理不够。不能退回
+		// 匿名/直连——那会让上游继续看到无主流量，问题更难查。
+		if key == "" && len(cfg.Keys) > 0 && egressBindingActive() {
+			return nil, rateLimited, egressShortfallError("zen", egressNSZen, cfg.Keys)
+		}
+		// 出口必须在 key 之后选：绑定策略下一个 key 固定一个代理，
+		// 按请求轮转会让同一个 key 从多个 IP 出去（上游据此判可疑）。
+		// pinKey/ZEN_PIN_KEY 绕过轮转，这条同样挡住它们——否则面板 Test
+		// 会以直连发出，给该 key 记下一个额外的 IP。
+		proxyURL, pidx, perr := zenEgress(key)
+		if perr != nil {
+			return nil, rateLimited, perr
+		}
+		viaProxy := "direct"
+		if proxyURL != "" {
+			viaProxy = maskProxyURL(proxyURL)
+		}
 		sess, user, ua := "", "", ""
 		if key != "" {
 			// 会话粘性：同一 key 复用稳定的 sess_/UA（免费门校验 sess_ 格式，
@@ -1914,17 +1975,6 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
 
 	for attempt := 0; ; attempt++ {
-		// 代理轮转（round_robin 默认）: 每次上游尝试显式挑选出口,
-		// 冷却中的代理被跳过; 未配置代理时直连。
-		proxyURL, pidx := pickUpstreamProxy()
-		viaProxy := "direct"
-		if proxyURL != "" {
-			viaProxy = maskProxyURL(proxyURL)
-		}
-		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyJSON))
-		if err != nil {
-			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
-		}
 		// 客户端身份：会话粘性——同一 key 复用稳定的会话 ID/UA（免费门是
 		// sess_ 格式校验而非服务端绑定，粘住身份仍利于上游侧一致性），
 		// msg_ 请求 ID 每次随机。
@@ -1939,6 +1989,24 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 			if pk := pinnedZenKey(); pk != "" {
 				key = pk
 			}
+		}
+		// 出口在 key 之后选：绑定策略下一个 key 固定一个代理，按请求轮转
+		// 会让同一个 key 从多个 IP 出去——2026-10-21 起 zen 按 key 记录出口，
+		// 这正是它判定"整池 key 可疑"的指纹。
+		if key == "" && len(cfg.Keys) > 0 && egressBindingActive() {
+			return nil, rateLimited, egressShortfallError("zen", egressNSZen, cfg.Keys)
+		}
+		proxyURL, pidx, perr := zenEgress(key)
+		if perr != nil {
+			return nil, rateLimited, perr
+		}
+		viaProxy := "direct"
+		if proxyURL != "" {
+			viaProxy = maskProxyURL(proxyURL)
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyJSON))
+		if err != nil {
+			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
 		}
 		sess, user, ua := StickyZenIdentity(key)
 		req.Header.Set("Authorization", "Bearer "+key)

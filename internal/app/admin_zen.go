@@ -38,6 +38,8 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"failoverMinutes":      cfg.FailoverMinutes,
 		"compaction":           cfg.Compaction,
 		"sessionRotateMinutes": cfg.SessionRotateMinutes,
+		"pinProxyPerKey":       pinProxyPerKeyEnabled(),
+		"egress":               zenEgressSnapshot(),
 		"runtime": map[string]any{
 			"failoverActive": zenFailedNow(),
 			"proxyCooldowns": zenProxyCooldownStatus(),
@@ -74,7 +76,9 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		FailoverMinutes *int     `json:"failoverMinutes"`
 		// 会话轮换周期（分钟）：0 = 关闭轮换，需与"未提交"区分故用指针。
 		SessionRotateMinutes *int `json:"sessionRotateMinutes"`
-		Compaction           *struct {
+		// 每 key 固定出口代理：指针用于区分"未提交"与显式 false。
+		PinProxyPerKey *bool `json:"pinProxyPerKey"`
+		Compaction     *struct {
 			Auto         *bool   `json:"auto"`
 			Buffer       *int    `json:"buffer"`
 			KeepTokens   *int    `json:"keepTokens"`
@@ -100,6 +104,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		FailoverMinutes:      cur.FailoverMinutes,
 		Compaction:           cur.Compaction,
 		SessionRotateMinutes: cur.SessionRotateMinutes,
+		PinProxyPerKey:       cur.PinProxyPerKey,
 	}
 	if patch.Enabled != nil {
 		next.Enabled = *patch.Enabled
@@ -149,6 +154,9 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	// 0 是合法值（关闭轮换），不能用 > 0 过滤；负值视为无效忽略。
 	if patch.SessionRotateMinutes != nil && *patch.SessionRotateMinutes >= 0 {
 		next.SessionRotateMinutes = *patch.SessionRotateMinutes
+	}
+	if patch.PinProxyPerKey != nil {
+		next.PinProxyPerKey = patch.PinProxyPerKey
 	}
 	if patch.Compaction != nil {
 		base := cur.Compaction

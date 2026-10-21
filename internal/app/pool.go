@@ -210,6 +210,8 @@ func addAccount(acc *Account) {
 	p.Accounts = append(p.Accounts, acc)
 	poolMu.Unlock()
 	savePool()
+	// 新账号要参与出口分配（可能就分到下一个空闲代理）
+	reconcileEgressBindings()
 }
 
 func removeAccount(accountID string) bool {
@@ -221,6 +223,8 @@ func removeAccount(accountID string) bool {
 			p.Accounts = append(p.Accounts[:i], p.Accounts[i+1:]...)
 			savePoolLocked()
 			poolMu.Unlock()
+			// 释放该账号占用的代理给下一个账号
+			reconcileEgressBindings()
 			return true
 		}
 	}
@@ -392,7 +396,23 @@ func pickAccount() *Account {
 // pickAccountExcluding 取一个 active 账号,跳过 exclude 中的账号 ID（并跳过
 // 无凭证账号）。供 callClineAPI 的跨账号 failover 使用: 429/5xx 后换一个
 // 不同的账号重试,而不是把整个请求判死。
-func pickAccountExcluding(exclude map[string]bool) *Account {
+//
+// useProxies 为 true 且绑定策略生效时，只返回"分到了出口代理"的账号：
+// 没有出口的账号被过滤掉，而不是退回直连——cline 若也推行"一账号一 IP"，
+// 直连流量正是它用来识别同一个人的依据。
+func pickAccountExcluding(exclude map[string]bool, useProxies bool) *Account {
+	// 先在 poolMu 之外算好"哪些账号有出口"：egress 路径会取 zenConfigMu /
+	// egressMu，不能与 poolMu 嵌套（账号增删路径是 poolMu 里直接返回的）。
+	needEgress := useProxies && egressBindingActive()
+	var egressOK map[string]bool
+	if needEgress {
+		egressOK = map[string]bool{}
+		for _, id := range poolAccountIDs() {
+			if _, ok := egressProxyForCline(id); ok {
+				egressOK[id] = true
+			}
+		}
+	}
 	p := loadPool()
 	poolMu.Lock()
 
@@ -410,6 +430,9 @@ func pickAccountExcluding(exclude map[string]bool) *Account {
 			continue
 		}
 		if a.APIToken == "" && a.RefreshToken == "" {
+			continue
+		}
+		if needEgress && !egressOK[a.AccountID] {
 			continue
 		}
 		active = append(active, a)
