@@ -247,6 +247,12 @@ type zenConfigData struct {
 	Enabled         bool             `json:"enabled"`
 	Key             string           `json:"key"`            // 兼容字段：始终等于 Keys[0]（旧版单 key 读取用）
 	Keys            []string         `json:"keys,omitempty"` // zen 多 key 池，请求按 round-robin 轮转
+	// OrgID：OAuth 账户的组织 ID（x-opencode-org-id）。CLI v2 在 OAuth
+	// 账户流量中发该头，原始 API key 流量中没有。网关无法从 key 字符串
+	// 推导它，空值即省略（正确）；使用 OAuth token 作 key 时，应从
+	// 账户元数据填入，否则上游看到 OAuth token 却无 org 头，与官方
+	// 客户端形态不一致。绝不编造。
+	OrgID string `json:"orgID,omitempty"`
 	BaseURL         string           `json:"baseURL"`
 	Proxies         []string         `json:"proxies"`         // http(s)/socks5 代理,轮询出口
 	ProxyStrategy   string           `json:"proxyStrategy"`   // round_robin / random / fill
@@ -822,20 +828,23 @@ func pinnedZenKey() string {
 // CLI 一致）。校验规则 2026-10-15 在新 inference 后端重新实测：缺工具 →
 // 403；工具在但 parameters 为空 schema → 403；描述文本、tool_choice、UA
 // 均不参与校验。注入的定义（描述+schema）统一取 zen_gate_tools.go 的官方
-// CLI 1.19.0 原文，本表只保留名字与精简描述作兜底/名录用途。
-// 单一来源：改名/增删必须同时满足两个端点的校验，只改这里。
+// CLI 2.1.4 原文（2026-10-26 认证抓包），本表只保留名字与精简描述作兜底/名录用途。
+// v2 与 v1 的区别：bash/task/todowrite 被移除，新增 question/subagent/
+// execute，顺序为 CLI 发送顺序。单一来源：改名/增删必须同时满足两个
+// 端点的校验，只改这里。
 var zenGateToolSpecs = []struct{ name, desc string }{
-	{"bash", "Execute a bash command"},
 	{"edit", "Edit a file"},
 	{"glob", "Find files by glob pattern"},
 	{"grep", "Search file contents"},
+	{"question", "Ask the user a question"},
 	{"read", "Read a file"},
+	{"shell", "Execute a shell command"},
 	{"skill", "Load a skill"},
-	{"task", "Run a background task"},
-	{"todowrite", "Write a todo list"},
+	{"subagent", "Run a subagent"},
 	{"webfetch", "Fetch a web page"},
 	{"websearch", "Search the web"},
 	{"write", "Write a file"},
+	{"execute", "Run JavaScript in a confined Code Mode runtime"},
 }
 
 // zenGateTools chat 端点形态：tools[].{type,function:{name,description,parameters}}。
@@ -896,28 +905,105 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 	delete(body, "reasoningEffort")
 	// FreeTier gate（2026-09-18 实测解码）：zen 免费层 chat 端点校验请求体
 	// 是否携带 opencode 工具集，缺失则 403（"can only be used from within
-	// OpenCode"）。恒注入 11 个规范工具名保证过闸。tool_choice 按客户端
-	// 是否带工具分流（实测对比）：
-	//  - 客户端无工具（纯文本问答）：tool_choice=none。auto 会让部分模型
-	//    （ling 多轮实测）在有工具但无需调用时返回空文本；none 保证回复。
-	//  - 客户端带工具（IDE agent 模式，Cursor 等）：客户端定义优先（同名时
-	//    覆盖 gate 占位 stub，模型才能拿到真实参数 schema）+ tool_choice=auto，
-	//    模型可发起调用、IDE 执行后回传结果（实测 ling 调用客户端自定义
-	//    get_weather 成功）。客户端显式 none 时尊重（实测 chat 端点接受 none）。
+	// OpenCode"）。恒注入 12 个 v2 规范工具名保证过闸。
+	// tool_choice：CLI v2 在 chat 路径完全不发该字段（2026-10-26 认证
+	// 抓包，body keys 无 tool_choice），上游缺省即 auto，简单问答仍
+	// 回文本（CLI hi 实测）。旧网关的 none/auto 强制值是 v1 遗留指纹，
+	// 2026-10-26 实验：TLS/UA/头/工具全部对齐后仍 429，tool_choice 是
+	// 剩余差异之一，故改为：客户端显式指定时原样透传，否则省略。
 	delete(body, "functions")
 	delete(body, "function_call")
 	clientTools := zenClientTools(params)
 	if len(clientTools) == 0 {
 		body["tools"] = zenGateTools()
-		body["tool_choice"] = "none"
 	} else {
 		body["tools"] = zenMergeTools(clientTools, zenGateTools())
-		body["tool_choice"] = "auto"
-		if tc, _ := params["tool_choice"].(string); tc == "none" {
-			body["tool_choice"] = "none"
+	}
+	if tc, ok := params["tool_choice"]; ok {
+		body["tool_choice"] = tc
+	} else {
+		delete(body, "tool_choice")
+	}
+	ensureZenEnvMarkerChat(body)
+	return body
+}
+
+// zenEnvBlock returns the CLI's <env> marker block. 2026-10-26 ablation
+// (raw uTLS call, same IP/account/TLS/headers/tools, body varied one
+// element at a time): removing the system prompt -> 429; truncating it
+// to 8000 chars -> 429; last 1000 chars alone -> 200; env block alone
+// -> 200; env block without "Working directory:" -> 429; "Working
+// directory:" outside <env> -> 429; fake directory value -> 200.
+// Upstream therefore checks, in a system message, for a line
+// "Working directory:" inside <env>...</env> — the CLI always injects
+// this block (working directory, platform, git status, date) at the
+// end of its system prompt, and a generic OpenAI client does not.
+// The value itself is not validated, so the gateway uses its own
+// working directory (truthful for the gateway process) rather than
+// fabricating a client's directory.
+func zenEnvBlock() string {
+	wd, err := os.Getwd()
+	if err != nil || wd == "" {
+		wd = "/tmp/opencode"
+	}
+	return "<env>\n  Working directory: " + wd + "\n</env>"
+}
+
+func zenTextHasEnvMarker(s string) bool {
+	return strings.Contains(s, "<env>") && strings.Contains(s, "Working directory:")
+}
+
+// ensureZenEnvMarkerChat appends the env block to the first system
+// message (or prepends a system message with just the block) when no
+// system/developer message already carries the marker. It never
+// removes or rewrites client content; it only appends the marker the
+// free tier checks for, at the end, mirroring CLI's layout.
+func ensureZenEnvMarkerChat(body map[string]any) {
+	msgs, ok := body["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := mm["role"].(string)
+		if role != "system" && role != "developer" {
+			continue
+		}
+		if s, ok := mm["content"].(string); ok && zenTextHasEnvMarker(s) {
+			return
 		}
 	}
-	return body
+	// No marker yet: append to the first string system message if one
+	// exists, otherwise prepend a system message with just the block.
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := mm["role"].(string)
+		if role != "system" && role != "developer" {
+			continue
+		}
+		if s, ok := mm["content"].(string); ok {
+			mm["content"] = s + "\n\n" + zenEnvBlock()
+			return
+		}
+	}
+	body["messages"] = append([]any{map[string]any{"role": "system", "content": zenEnvBlock()}}, msgs...)
+}
+
+func ensureZenEnvMarkerResponses(body map[string]any) {
+	if s, ok := body["instructions"].(string); ok && zenTextHasEnvMarker(s) {
+		return
+	}
+	if s, ok := body["instructions"].(string); ok && s != "" {
+		body["instructions"] = s + "\n\n" + zenEnvBlock()
+		return
+	}
+	body["instructions"] = zenEnvBlock()
 }
 
 // zenClientTools 提取客户端工具（chat 嵌套形态 tools[]，兼容已废弃的
@@ -1160,6 +1246,7 @@ func buildZenResponsesBody(params map[string]any, modelID string, promptKey stri
 	// 客户端工具（chat 嵌套或已是 flat）优先于同名 gate stub，schema 才不丢。
 	body["tools"] = zenMergeResponsesTools(zenClientFlatTools(params))
 	body["tool_choice"] = "auto"
+	ensureZenEnvMarkerResponses(body)
 	return body
 }
 
@@ -1168,12 +1255,41 @@ func buildZenResponsesBody(params map[string]any, modelID string, promptKey stri
 // 直接写 map（而非 Header.Set）以保留小写头名：官方 CLI 发的就是小写，
 // Set 会规范化为 X-Opencode-...；HTTP 头大小写不敏感，但字节级对齐更安全。
 // Authorization/Content-Type/User-Agent 因需承载变量，由调用方先行设置。
+// 2026-10-26 实测（CLI v2.1.4 认证抓包）：
+//   - CLI v2 在两条路径都发 x-opencode-session-id, x-opencode-session,
+//     x-session-affinity, x-session-id，四个头同值（新鲜会话时四者
+//     相等；父会话/分支会话时 q 规则见静态 RE 报告，网关粘性会话
+//     属于新鲜会话情形，故四者同值正确）。
+//   - CLI v2 完全不发 x-opencode-request（静态计数 0，抓包亦无）。
+//     旧网关仍发该头是 v1 遗留指纹，必须去掉；requestID 参数保留
+//     仅为调用点兼容，不再写入任何头。
+//   - x-opencode-org-id 只在 OAuth 账户元数据有 orgID 时出现，网关
+//     的原始 key 字符串中没有该信息，绝不编造，缺省即正确。
+//   - x-opencode-project：网关没有客户端项目目录，global 是唯一诚实值。
 func setZenGateHeaders(req *http.Request, sess, requestID string) {
+	_ = requestID // v2 CLI does not send x-opencode-request; do not emit it
 	req.Header["x-opencode-session-id"] = []string{sess}
 	req.Header["x-opencode-session"] = []string{sess}
-	req.Header["x-opencode-request"] = []string{requestID}
+	req.Header["x-session-affinity"] = []string{sess}
+	req.Header["x-session-id"] = []string{sess}
 	req.Header["x-opencode-client"] = []string{"cli"}
 	req.Header["x-opencode-project"] = []string{"global"}
+	if org := getZenConfig().OrgID; org != "" {
+		req.Header["x-opencode-org-id"] = []string{org}
+	}
+	// CLI v2 wire headers (2026-10-26 capture): Accept */*, and the
+	// full Accept-Encoding list. Go's default is only "gzip" and no
+	// Accept header, which is another non-CLI fingerprint marker.
+	// Setting Accept-Encoding explicitly disables Go's automatic gzip
+	// decompression; upstream SSE for stream=true is uncompressed in
+	// practice, and the gateway parses SSE as raw bytes, so this is safe.
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	// CLI v2 tracing headers, same trace/span across b3 and traceparent.
+	traceID := kit.RandHex(16)
+	spanID := kit.RandHex(8)
+	req.Header.Set("b3", traceID+"-"+spanID+"-1")
+	req.Header.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
 }
 
 // zenClientFlatTools 提取客户端工具并转成 responses 端点要求的 flat 形态。

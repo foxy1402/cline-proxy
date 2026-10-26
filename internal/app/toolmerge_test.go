@@ -68,16 +68,16 @@ func TestZenClientFlatToolsShapes(t *testing.T) {
 }
 
 func TestBuildZenBodyToolChoicePolicy(t *testing.T) {
-	// 无客户端工具：gate 11 名 + tool_choice=none（纯文本问答模式）
+	// 无客户端工具：gate 工具 + tool_choice 省略（CLI v2 不发该字段，上游缺省 auto）
 	body := buildZenBody(map[string]any{"model": "ling-2.6-flash", "messages": []any{}}, false)
 	tools, _ := body["tools"].([]any)
 	if len(tools) != len(zenGateToolSpecs) {
 		t.Fatalf("gate tools = %d, want %d", len(tools), len(zenGateToolSpecs))
 	}
-	if body["tool_choice"] != "none" {
-		t.Errorf("tool_choice = %v, want none when client sent no tools", body["tool_choice"])
+	if _, ok := body["tool_choice"]; ok {
+		t.Errorf("tool_choice = %v, want omitted (CLI v2 sends none) when client sent no tools", body["tool_choice"])
 	}
-	// 客户端带工具：auto
+	// 客户端带工具：同样省略（上游缺省 auto），除非客户端显式指定
 	body = buildZenBody(map[string]any{
 		"model":    "ling-2.6-flash",
 		"messages": []any{},
@@ -85,8 +85,8 @@ func TestBuildZenBodyToolChoicePolicy(t *testing.T) {
 			"name": "get_weather", "parameters": map[string]any{"type": "object"},
 		}}},
 	}, false)
-	if body["tool_choice"] != "auto" {
-		t.Errorf("tool_choice = %v, want auto when client sent tools", body["tool_choice"])
+	if _, ok := body["tool_choice"]; ok {
+		t.Errorf("tool_choice = %v, want omitted (CLI v2 sends none) when client sent tools", body["tool_choice"])
 	}
 	tools, _ = body["tools"].([]any)
 	if len(tools) != len(zenGateToolSpecs)+1 {
@@ -131,8 +131,8 @@ func TestBuildZenBodyLegacyFunctions(t *testing.T) {
 	if !found {
 		t.Error("legacy functions[] not converted into tools[]")
 	}
-	if body["tool_choice"] != "auto" {
-		t.Errorf("tool_choice = %v, want auto for converted legacy functions", body["tool_choice"])
+	if _, ok := body["tool_choice"]; ok {
+		t.Errorf("tool_choice = %v, want omitted (CLI v2 sends none) for converted legacy functions", body["tool_choice"])
 	}
 }
 

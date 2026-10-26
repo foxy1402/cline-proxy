@@ -16,9 +16,9 @@ import (
 // 真实 schema 实测通过），但这里仍存官方原文，保持与 CLI 字节级一致，
 // 避免上游日后加严描述校验时再次全灭。
 //
-// 数据来源：opencode CLI 1.19.0 本地抓包（chat 形态与 responses 形态的
-// parameters 不同：responses 的 @ai-sdk/openai 会剥 $schema 与 min/max
-// 约束，故两套都存）。zen_gate_tools.json 由抓包生成，勿手改。
+// 数据来源：opencode CLI 2.1.4 本地抓包（2026-10-26，认证账户，干净代理
+// IP；chat 形态与 responses 形态的 parameters 不同：responses 形态剥
+// min/max 约束，故两套都存）。zen_gate_tools.json 由抓包生成，勿手改。
 // ============================================================================
 
 //go:embed zen_gate_tools.json

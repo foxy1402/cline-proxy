@@ -51,11 +51,11 @@ var (
 	// 任何 save 都会把磁盘上读不到的原文件覆盖掉。宁可本次运行不落盘，也不能
 	// 销毁可能有价值的数据（重启后重试读取）。
 	zenSessSaveBlocked bool
-	// zenNativeUA 官方 CLI 的原生 ai-sdk 形态 UA（会话粘性与轮换列表共用）。
-	// opencode 版本按最新 CLI 核对（audit 2026-10-10：1.18.31 → 1.18.35）；
-	// ai-sdk / bun 段保持不变——它们对应 TLS 指纹（tls_bun.go 的 Bun hello），
-	// 与 opencode 应用版本无关，改动这两段才会与指纹失配。
-	zenNativeUA = "opencode/1.18.35 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
+	// zenNativeUA 官方 CLI v2 的 UA（会话粘性与轮换列表共用）。
+	// 2026-10-26 实测：CLI v2.1.4 在 chat 与 responses 两条路径都发
+	// opencode/latest/2.1.4/cli；旧 ai-sdk 形态 UA（1.18.35）已不再是
+	// 官方客户端的 UA，与 v2 TLS 指纹组合时会被上游识别为旧客户端。
+	zenNativeUA = "opencode/latest/2.1.4/cli"
 )
 
 // defaultSessionRotateMinutes 粘性会话的默认轮换周期（分钟）。语义见

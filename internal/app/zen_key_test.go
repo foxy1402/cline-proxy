@@ -581,8 +581,8 @@ func TestZenResponses403RefreshesSameKeyOnceThenCoolsAndFails(t *testing.T) {
 }
 
 // setZenGateHeaders 契约：两条 zen 上游路径共用的身份头必须齐全，且
-// session 头两处同值、request 头独立。上游按这些头做 CLI 指纹判定，
-// 少一个就可能被判非 CLI 流量而 403。
+// 四个 session 头同值；v2 CLI 不发 x-opencode-request，网关也不发。
+// 上游按这些头做 CLI 指纹判定，少一个就可能被判非 CLI 流量而 403。
 // 直接读 raw map（不用 Header.Get）：本函数刻意用小写头名以字节级对齐官方
 // CLI，而 Get 会规范化键名，读不到小写条目。
 func TestSetZenGateHeadersContract(t *testing.T) {
@@ -594,7 +594,8 @@ func TestSetZenGateHeadersContract(t *testing.T) {
 	want := map[string]string{
 		"x-opencode-session-id": "ses_abc123",
 		"x-opencode-session":    "ses_abc123",
-		"x-opencode-request":    "msg_xyz789",
+		"x-session-affinity":    "ses_abc123",
+		"x-session-id":          "ses_abc123",
 		"x-opencode-client":     "cli",
 		"x-opencode-project":    "global",
 	}

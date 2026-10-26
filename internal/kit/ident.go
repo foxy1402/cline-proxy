@@ -27,18 +27,10 @@ func WithRetryJitter(delay time.Duration) time.Duration {
 // ============================================================================
 
 var ZenUserAgents = []string{
-	"opencode/latest/1.18.14/cli",
-	"opencode/latest/1.18.13/cli",
-	"opencode/1.18.14/cli",
-	"opencode/1.18.13/cli",
-	"opencode/1.18.12/cli",
-	"opencode/1.18.11/cli",
-	"opencode/latest/1.18.14/desktop",
-	"opencode/latest/1.18.13/desktop",
-	// 原生 responses 路径实测：官方 CLI 发 ai-sdk 形态 UA；网关轮换列表
-	// 加入该条目以匹配官方客户端指纹（AI-SDK/bun 段对应 TLS 指纹见 tls_bun.go；
-	// opencode 版本随最新 CLI，2026-10-10 核对为 1.18.35）
-	"opencode/1.18.35 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+	// 2026-10-26 实测：CLI v2.1.4 只发这一个 UA。旧版本轮换会让同一
+	// key/会话在不同请求间换 UA 版本，正是上游识别非官方客户端的
+	// 信号之一；因此不再轮换旧 UA，只保留 v2 UA。
+	"opencode/latest/2.1.4/cli",
 }
 
 // mustRand 读满 n 字节加密随机数；crypto/rand 失败说明系统熵源异常，
