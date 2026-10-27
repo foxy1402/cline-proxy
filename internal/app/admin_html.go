@@ -565,9 +565,11 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <label class="hint" style="margin:0">Probe model (used by the Test buttons):</label>
       <select id="ocProbeModel" style="max-width:300px"><option value="">auto — big-pickle first, then live models</option></select>
       <label class="hint" style="margin:0 0 0 6px">Session rotation (min):</label>
-      <input type="text" id="ocSessionRotate" placeholder="120" style="max-width:90px" title="Mint a fresh session id for a key once it is this old. 0 = never rotate (a long-lived session makes the first request slow after a few days).">
+      <input type="text" id="ocSessionRotate" placeholder="120" style="max-width:90px" title="Legacy: sticky-session rotation interval. Sessions are minted per API call since 2026-10-27, so the rotator is disabled and this value is inert.">
+      <label class="hint" style="margin:0 0 0 6px">Org ID:</label>
+      <input type="text" id="ocOrgID" placeholder="wrk_… (optional)" style="max-width:220px" title="OAuth account org id, sent as x-opencode-org-id. Only needed when the key is an OAuth token rather than a raw API key; leave empty to omit the header.">
     </div>
-    <p class="hint" style="margin-top:0">Per-key session state is shown in the table below. Session IDs are minted locally and match the upstream's format gate (<code>^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$</code>) — no CLI or harvester involved. On repeated FreeTier 403s, or once a session is older than the rotation interval, a key's session is refreshed with a freshly minted one automatically.</p>
+    <p class="hint" style="margin-top:0">Session IDs are minted locally, one per API call, and match the upstream's format gate (<code>^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$</code>) — no CLI or harvester involved. The sticky-session table below is informational only; upstream calls no longer reuse a session across requests.</p>
     <div class="form-row">
       <div class="field"><label>Pin one egress proxy per key</label>
         <select id="ocPinProxy"><option value="true">On — one key, one exit IP</option><option value="false">Off — rotate per request</option></select>
@@ -1312,6 +1314,7 @@ async function loadOcConfig() {
     _('ocFailoverCount').value = c.failoverCount || 3;
     _('ocFailoverMinutes').value = c.failoverMinutes || 5;
     if (_('ocSessionRotate')) _('ocSessionRotate').value = (c.sessionRotateMinutes != null ? c.sessionRotateMinutes : 120);
+    if (_('ocOrgID')) _('ocOrgID').value = c.orgID || '';
     if (_('ocPinProxy')) _('ocPinProxy').value = String(c.pinProxyPerKey !== false);
     const eg = c.egress || {};
     if (_('ocEgressInfo')) {
@@ -1355,6 +1358,7 @@ async function saveOcConfig() {
     failoverCount: parseInt(_('ocFailoverCount').value) || 3,
     failoverMinutes: parseInt(_('ocFailoverMinutes').value) || 5,
     sessionRotateMinutes: rot,
+    orgID: _('ocOrgID') ? _('ocOrgID').value.trim() : '',
     pinProxyPerKey: _('ocPinProxy') ? _('ocPinProxy').value === 'true' : true,
     compaction: {
       auto: _('ocCompactAuto').value === 'true',

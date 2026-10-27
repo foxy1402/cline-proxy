@@ -38,6 +38,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"failoverMinutes":      cfg.FailoverMinutes,
 		"compaction":           cfg.Compaction,
 		"sessionRotateMinutes": cfg.SessionRotateMinutes,
+		"orgID":                cfg.OrgID,
 		"pinProxyPerKey":       pinProxyPerKeyEnabled(),
 		"egress":               zenEgressSnapshot(),
 		"runtime": map[string]any{
@@ -76,6 +77,8 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		FailoverMinutes *int     `json:"failoverMinutes"`
 		// 会话轮换周期（分钟）：0 = 关闭轮换，需与"未提交"区分故用指针。
 		SessionRotateMinutes *int `json:"sessionRotateMinutes"`
+		// OAuth 账户组织 ID（x-opencode-org-id）。空串表示清除该头。
+		OrgID *string `json:"orgID"`
 		// 每 key 固定出口代理：指针用于区分"未提交"与显式 false。
 		PinProxyPerKey *bool `json:"pinProxyPerKey"`
 		Compaction     *struct {
@@ -104,6 +107,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		FailoverMinutes:      cur.FailoverMinutes,
 		Compaction:           cur.Compaction,
 		SessionRotateMinutes: cur.SessionRotateMinutes,
+		OrgID:                cur.OrgID,
 		PinProxyPerKey:       cur.PinProxyPerKey,
 	}
 	if patch.Enabled != nil {
@@ -157,6 +161,10 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.PinProxyPerKey != nil {
 		next.PinProxyPerKey = patch.PinProxyPerKey
+	}
+	if patch.OrgID != nil {
+		// 空串即清除（不编造 org id：原始 API key 流量本来就没有）。
+		next.OrgID = strings.TrimSpace(*patch.OrgID)
 	}
 	if patch.Compaction != nil {
 		base := cur.Compaction

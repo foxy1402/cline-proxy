@@ -68,16 +68,18 @@ func TestZenClientFlatToolsShapes(t *testing.T) {
 }
 
 func TestBuildZenBodyToolChoicePolicy(t *testing.T) {
-	// 无客户端工具：gate 工具 + tool_choice 省略（CLI v2 不发该字段，上游缺省 auto）
+	// 无客户端工具：gate 工具 + tool_choice=none。
+	// gate 工具只是过闸占位，客户端没有执行层；省略 tool_choice 会让上游
+	// 按 auto 处理，模型可返回客户端从未声明的 read/shell 调用。
 	body := buildZenBody(map[string]any{"model": "ling-2.6-flash", "messages": []any{}}, false)
 	tools, _ := body["tools"].([]any)
 	if len(tools) != len(zenGateToolSpecs) {
 		t.Fatalf("gate tools = %d, want %d", len(tools), len(zenGateToolSpecs))
 	}
-	if _, ok := body["tool_choice"]; ok {
-		t.Errorf("tool_choice = %v, want omitted (CLI v2 sends none) when client sent no tools", body["tool_choice"])
+	if body["tool_choice"] != "none" {
+		t.Errorf("tool_choice = %v, want none when client sent no tools (gate stubs are not callable)", body["tool_choice"])
 	}
-	// 客户端带工具：同样省略（上游缺省 auto），除非客户端显式指定
+	// 客户端带工具但未指定：auto，让模型按需调用客户端真实工具
 	body = buildZenBody(map[string]any{
 		"model":    "ling-2.6-flash",
 		"messages": []any{},
@@ -85,8 +87,8 @@ func TestBuildZenBodyToolChoicePolicy(t *testing.T) {
 			"name": "get_weather", "parameters": map[string]any{"type": "object"},
 		}}},
 	}, false)
-	if _, ok := body["tool_choice"]; ok {
-		t.Errorf("tool_choice = %v, want omitted (CLI v2 sends none) when client sent tools", body["tool_choice"])
+	if body["tool_choice"] != "auto" {
+		t.Errorf("tool_choice = %v, want auto when client sent tools but no preference", body["tool_choice"])
 	}
 	tools, _ = body["tools"].([]any)
 	if len(tools) != len(zenGateToolSpecs)+1 {
@@ -131,8 +133,8 @@ func TestBuildZenBodyLegacyFunctions(t *testing.T) {
 	if !found {
 		t.Error("legacy functions[] not converted into tools[]")
 	}
-	if _, ok := body["tool_choice"]; ok {
-		t.Errorf("tool_choice = %v, want omitted (CLI v2 sends none) for converted legacy functions", body["tool_choice"])
+	if body["tool_choice"] != "auto" {
+		t.Errorf("tool_choice = %v, want auto for converted legacy functions (client declared them)", body["tool_choice"])
 	}
 }
 

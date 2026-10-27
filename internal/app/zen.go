@@ -439,6 +439,13 @@ func loadZenConfig() *zenConfigData {
 		cfg.SessionRotateMinutes = n
 		log.Printf("zen session rotation interval set from env: %d min", n)
 	}
+	// ZEN_ORG_ID：OAuth 账户的组织 ID，写入 x-opencode-org-id 头。
+	// 原始 API key 里没有这个信息，无法推导；只有用 OAuth token 作 key 时
+	// 才需要显式配置。未设置即省略该头（上游对原始 key 流量也不发）。
+	if org := envStr("ZEN_ORG_ID"); org != "" {
+		cfg.OrgID = org
+		log.Printf("zen org id set from env: %s", org)
+	}
 	normalizeZenKeys(cfg)
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = zenAPIBase
@@ -919,10 +926,19 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 	} else {
 		body["tools"] = zenMergeTools(clientTools, zenGateTools())
 	}
-	if tc, ok := params["tool_choice"]; ok {
+	// tool_choice 分流（客户端必须拿到它声明的语义）：
+	//  - 客户端无工具（纯文本问答）：恒定 none，即使客户端传了 auto/required。
+	//    此时 tools[] 里只有 gate 占位 stub，客户端没有执行层；让上游按
+	//    auto/required 处理会让模型返回 read/shell/execute 这类客户端从未
+	//    声明的调用，IDE 解析失败（required 更会强制成一次必失败的工具调用）。
+	//  - 客户端有工具但没指定：auto，让模型按需调用客户端真实工具。
+	//  - 客户端显式指定且有工具：原样透传。
+	if len(clientTools) == 0 {
+		body["tool_choice"] = "none"
+	} else if tc, ok := params["tool_choice"]; ok {
 		body["tool_choice"] = tc
 	} else {
-		delete(body, "tool_choice")
+		body["tool_choice"] = "auto"
 	}
 	ensureZenEnvMarkerChat(body)
 	return body
@@ -953,14 +969,51 @@ func zenTextHasEnvMarker(s string) bool {
 	return strings.Contains(s, "<env>") && strings.Contains(s, "Working directory:")
 }
 
+// zenContentText 取出 message content 的纯文本，兼容三种客户端形态：
+// 裸字符串、parts 数组 [{"type":"text","text":...}]（IDE 常见）、
+// 单 part 对象。仅用于 marker 检测，不做内容改写。
+func zenContentText(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var b strings.Builder
+		for _, p := range c {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s, ok := pm["text"].(string); ok {
+				b.WriteString(s)
+				b.WriteString("\n")
+			}
+		}
+		return b.String()
+	case map[string]any:
+		if s, ok := c["text"].(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
 // ensureZenEnvMarkerChat appends the env block to the first system
 // message (or prepends a system message with just the block) when no
 // system/developer message already carries the marker. It never
 // removes or rewrites client content; it only appends the marker the
 // free tier checks for, at the end, mirroring CLI's layout.
+//
+// 两点必须成立，否则会伤到客户端：
+//  1. marker 检测必须看得懂 parts 数组形态。只认 string 时，已带
+//     marker 的数组 system 会被判为"没有"，于是又 prepend 一个
+//     system 消息，产生两条相邻 system。
+//  2. 不得就地改写调用方的 messages。body["messages"] 与
+//     params["messages"] 同底层切片（buildZenBody 只做浅拷贝），
+//     就地改 map 会把 marker 写进客户端参数，端点自适应重试、
+//     日志、token 估算随后读到的都是被污染的版本。
 func ensureZenEnvMarkerChat(body map[string]any) {
 	msgs, ok := body["messages"].([]any)
-	if !ok {
+	if !ok || len(msgs) == 0 {
 		return
 	}
 	for _, m := range msgs {
@@ -972,13 +1025,30 @@ func ensureZenEnvMarkerChat(body map[string]any) {
 		if role != "system" && role != "developer" {
 			continue
 		}
-		if s, ok := mm["content"].(string); ok && zenTextHasEnvMarker(s) {
+		if zenTextHasEnvMarker(zenContentText(mm["content"])) {
 			return
 		}
 	}
-	// No marker yet: append to the first string system message if one
-	// exists, otherwise prepend a system message with just the block.
-	for _, m := range msgs {
+	// 先复制消息 map（以及 parts 切片），再在副本上加 marker。
+	out := make([]any, len(msgs))
+	for i, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			out[i] = m
+			continue
+		}
+		cp := make(map[string]any, len(mm)+1)
+		for k, v := range mm {
+			cp[k] = v
+		}
+		if parts, ok := cp["content"].([]any); ok {
+			nc := make([]any, len(parts), len(parts)+1)
+			copy(nc, parts)
+			cp["content"] = nc
+		}
+		out[i] = cp
+	}
+	for _, m := range out {
 		mm, ok := m.(map[string]any)
 		if !ok {
 			continue
@@ -987,12 +1057,19 @@ func ensureZenEnvMarkerChat(body map[string]any) {
 		if role != "system" && role != "developer" {
 			continue
 		}
-		if s, ok := mm["content"].(string); ok {
-			mm["content"] = s + "\n\n" + zenEnvBlock()
-			return
+		switch c := mm["content"].(type) {
+		case string:
+			mm["content"] = c + "\n\n" + zenEnvBlock()
+		case []any:
+			// 数组形态：追加一个 text part，保持客户端原有结构。
+			mm["content"] = append(c, map[string]any{"type": "text", "text": zenEnvBlock()})
+		default:
+			mm["content"] = zenEnvBlock()
 		}
+		body["messages"] = out
+		return
 	}
-	body["messages"] = append([]any{map[string]any{"role": "system", "content": zenEnvBlock()}}, msgs...)
+	body["messages"] = append([]any{map[string]any{"role": "system", "content": zenEnvBlock()}}, out...)
 }
 
 func ensureZenEnvMarkerResponses(body map[string]any) {
@@ -1139,7 +1216,9 @@ func buildZenResponsesBody(params map[string]any, modelID string, promptKey stri
 				// system/developer 指令提升为顶层 instructions（Responses 标准字段；
 				// 官方 CLI 发 role=developer 条目且无顶层 instructions——网关把
 				// 历史 system/developer 内容并入 instructions 保持等价）
-				if s, ok := content.(string); ok && s != "" {
+				// 用 zenContentText 取文本：IDE 常发 parts 数组形态，只认
+				// string 会把客户端的系统提示词整段静默丢掉。
+				if s := zenContentText(content); s != "" {
 					if prev, _ := body["instructions"].(string); prev != "" {
 						body["instructions"] = prev + "\n\n" + s
 					} else {
@@ -1920,6 +1999,11 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 			}
 			return nil, rateLimited, fmt.Errorf("zen responses request: %w", err)
 		}
+		// 显式 Accept-Encoding 关闭了 net/http 的自动解压，必须自己解。
+		if derr := kit.DecodeResponse(resp); derr != nil {
+			resp.Body.Close()
+			return nil, rateLimited, fmt.Errorf("zen responses decode: %w", derr)
+		}
 		if resp.StatusCode == http.StatusOK {
 			markZenKeySuccess(key)
 			markZenSuccess()
@@ -2171,6 +2255,11 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 				continue
 			}
 			return nil, rateLimited, fmt.Errorf("zen request: %w", err)
+		}
+		// 显式 Accept-Encoding 关闭了 net/http 的自动解压，必须自己解。
+		if derr := kit.DecodeResponse(resp); derr != nil {
+			resp.Body.Close()
+			return nil, rateLimited, fmt.Errorf("zen decode: %w", derr)
 		}
 		if resp.StatusCode == http.StatusOK {
 			markZenKeySuccess(key)

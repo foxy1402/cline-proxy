@@ -605,4 +605,32 @@ func TestSetZenGateHeadersContract(t *testing.T) {
 			t.Errorf("raw header %q = %v, want [%q]", k, vals, v)
 		}
 	}
+	// 未配置 orgID 时不发该头（原始 API key 流量本就没有 org 信息，
+	// 编造一个只会与官方形态不符）。
+	if _, ok := req.Header["x-opencode-org-id"]; ok {
+		t.Error("x-opencode-org-id must be omitted when OrgID is unset")
+	}
+	// v2 CLI 不发该头（静态计数 0，抓包亦无）
+	if _, ok := req.Header["x-opencode-request"]; ok {
+		t.Error("x-opencode-request must NOT be sent (CLI v2 sends none)")
+	}
+}
+
+// ZEN_ORG_ID 配置后必须落到 x-opencode-org-id（此前该字段无任何写入路径，
+// 是死代码）。
+func TestSetZenGateHeadersOrgID(t *testing.T) {
+	cfg := getZenConfig()
+	cp := *cfg
+	cp.OrgID = "wrk_test_org_123"
+	setZenConfig(&cp)
+	t.Cleanup(func() { c := *cfg; setZenConfig(&c) })
+
+	req, err := http.NewRequest("POST", "http://example.invalid/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setZenGateHeaders(req, "ses_abc123", "")
+	if got := req.Header["x-opencode-org-id"]; len(got) != 1 || got[0] != "wrk_test_org_123" {
+		t.Fatalf("x-opencode-org-id = %v, want [wrk_test_org_123]", got)
+	}
 }

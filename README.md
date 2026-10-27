@@ -61,6 +61,9 @@ services:
       # opencode zen keys, comma-separated (optional; can also be set in the
       # admin panel later — panel keys survive restarts in the data volume)
       - ZEN_KEYS=${ZEN_KEYS:-}
+      # OAuth account org id, sent as x-opencode-org-id (optional; only needed
+      # when the key is an OAuth token rather than a raw API key)
+      - ZEN_ORG_ID=${ZEN_ORG_ID:-}
       # cline account seed file inside the volume (optional; import runs when
       # the pool is empty — drop cline-seed.json into the volume to use it)
       - CLINE_ACCOUNTS_SEED_FILE=/app/data/cline-seed.json
@@ -111,7 +114,8 @@ All state lives in the `/app/data` volume — dotfiles written `0600`: `.cline-a
 | `STRICT_MODEL_MATCH` | `true` | `400` for unknown model names instead of silently serving the default model |
 | `POOL_STRATEGY` | `round_robin` | Cline account strategy: `round_robin` / `fill` / `random` (env wins over panel config) |
 | `ZEN_KEYS` | empty | opencode zen keys, comma-separated; panel config is not overwritten when it already has keys |
-| `ZEN_SESSION_ROTATE_MINUTES` | `120` | Re-mint a key's sticky zen session once it is this old (minutes); `0` disables rotation |
+| `ZEN_ORG_ID` | empty | OAuth account org id, sent as `x-opencode-org-id`; not needed for raw API keys (the CLI only sends it for OAuth accounts) |
+| `ZEN_SESSION_ROTATE_MINUTES` | `120` | Legacy: sticky-session rotation interval. Sessions are minted per API call since 2026-10-27, so the rotator is disabled and this value is inert |
 | `CLINE_ACCOUNTS_SEED_FILE` | empty | Seed JSON imported at boot when the pool is empty |
 | `CLINE_USE_PROXIES` | `false` | Route the Cline upstream through the egress proxy pool |
 | `LOG_REQUESTS` | `true` | Request logging (metadata only: IP, path, model, status, duration — never conversation content) |
@@ -125,13 +129,15 @@ Fail-closed startup: binding a non-loopback address without `API_KEY` and `ADMIN
 
 ### opencode zen session IDs
 
-Zen session IDs are **minted locally** — the upstream's free-tier gate is a stateless format check (`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`), so the gateway generates a compatible, stable ID per zen key at first use and persists it in the data volume (`.zen-sessions.json`). There is no embedded CLI, no harvester, and no related environment variables. Legacy placeholder IDs (`sess_*`) in an existing session file are replaced with minted ones on first load.
+Zen session IDs are **minted locally, one per API call** — the upstream's free-tier gate is a format check (`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`), so the gateway generates a compatible ID per request. There is no embedded CLI, no harvester, and no related environment variables.
 
-The same format check now also applies to the per-request id (`x-opencode-request`, `^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`) and to the injected gate tools — so the request id is minted with the same descending construction as the session id, and the eleven gate tools carry the real opencode CLI parameter schemas (an empty `{"type":"object","properties":{}}` schema is rejected with `403 FreeTierError`; the tool descriptions are not checked). This is what the upstream's 2026-10 gateway change tightened.
+Since the v2 CLI (`2.1.4`) observation on 2026-10-27, the gateway no longer reuses one sticky session across unrelated requests: the official CLI creates a fresh session per `run` invocation, and a session reused across unrelated history-less requests gets flagged to midnight UTC after the first call passes. Each user API call therefore gets its own session, which is reused only for retries of that same call and re-minted if the key switches mid-call or a 403 forces a refresh. IDEs and agents (Cursor, ZCode, OpenClaw, Hermes) already send full history in every request, so nothing is lost — and it costs no extra upstream calls. The legacy sticky table is still persisted for the admin panel snapshot, but its age-based rotator is disabled.
 
-On repeated FreeTier `403`s the key's session is refreshed with a freshly minted one automatically (2 consecutive 403s trigger it, 1-minute per-key backoff); a sustained rise in the refresh rate in the logs is the tripwire that zen has tightened its gate.
+The same format check also applies to the per-request id and to the injected gate tools — the request id is minted with the same descending construction as the session id, and the twelve gate tools carry the real opencode CLI v2 parameter schemas (an empty `{"type":"object","properties":{}}` schema is rejected with `403 FreeTierError`; the tool descriptions are not checked). This is what the upstream's 2026-10 gateway change tightened.
 
-Sessions also **rotate on age**: a background rotator checks every key once a minute and re-mints any session older than `ZEN_SESSION_ROTATE_MINUTES` (default 120 = 2 h). An upstream session that has gone stale makes its first request noticeably slower even though the gateway still accepts it; a periodic local re-mint keeps that latency off the user's path. Rotation is free — the ID is minted locally, so nothing is sent upstream and no quota is consumed, and the rotator also pre-mints sessions for keys that have not been used yet (which is what keeps round-robin from collapsing onto a single key). Set the value to `0` to disable age-based rotation (missing sessions are still minted). The same interval is editable in the panel's opencode tab ("Session rotation (min)").
+On repeated FreeTier `403`s the session for that call is re-minted automatically (one retry per call); a sustained rise in the refresh rate in the logs is the tripwire that zen has tightened its gate.
+
+Requests also must carry a system message whose `<env>` block contains a `Working directory:` line — the CLI always appends this block and the free tier rejects bodies without it. The gateway appends it (using its own working directory) to an existing system/developer message when one is present, matching the client's own layout instead of adding a second system message.
 
 The zen route table is seeded deterministically from the model catalog's SDK package name (`provider.npm`: `@ai-sdk/openai` → native `/v1/responses`, `@ai-sdk/openai-compatible` → `/chat/completions`) and refined per model by the endpoint learner, whose decisions persist in `.zen-endpoints.json` and are never overwritten by later catalog syncs.
 
@@ -140,7 +146,8 @@ The upstream base URL is `https://opencode.ai/inference/v1` (the URL the current
 | Variable | Default | Description |
 |---|---|---|
 | `ZEN_PIN_KEY` | empty | Troubleshooting: pin all upstream attempts to key number *n* (1-based) instead of rotating, so one key can be tested in isolation |
-| `ZEN_SESSION_ROTATE_MINUTES` | `120` | Re-mint a key's sticky session once it is this old (minutes); `0` disables rotation (also editable in the panel) |
+| `ZEN_ORG_ID` | empty | OAuth account org id, sent as `x-opencode-org-id` when set; omit for raw API keys |
+| `ZEN_SESSION_ROTATE_MINUTES` | `120` | Legacy: sticky-session rotation interval. Sessions are minted per API call since 2026-10-27, so the rotator is disabled |
 
 ### One egress proxy per key
 

@@ -545,24 +545,11 @@ func rotateZenSessionsOnce() (minted, rotated int) {
 	return minted, rotated
 }
 
-// startZenSessionRotator 启动后台会话巡检（每分钟一次），保证所有配置 key 都有
-// 合法且新鲜的会话。与 startZenModelsRefresher 同形态：常驻 goroutine，进程退出
-// 即结束；第一轮在启动后立即执行，冷启动时就把整个池的会话建起来。
-func startZenSessionRotator() {
-	go func() {
-		if minted, rotated := rotateZenSessionsOnce(); minted > 0 || rotated > 0 {
-			log.Printf("zen session rotator: initial pass minted=%d rotated=%d", minted, rotated)
-		}
-		ticker := time.NewTicker(zenSessionRotateTick)
-		defer ticker.Stop()
-		for range ticker.C {
-			if !getZenConfig().Enabled {
-				continue
-			}
-			minted, rotated := rotateZenSessionsOnce()
-			if minted > 0 || rotated > 0 {
-				log.Printf("zen session rotator: minted=%d rotated=%d", minted, rotated)
-			}
-		}
-	}()
-}
+// startZenSessionRotator 停用（2026-10-27）。上游调用自 a99d94b 起每次
+// API 调用都用 zenCallIdentity 现铸会话，粘性会话表不再参与任何上游
+// 请求；继续每分钟巡检 + 每 120 分钟落盘只是空转写盘。
+//
+// 保留函数体为空而非删除，是为了让 proxy.go 的启动序列和 zen_session_test.go
+// 的直调测试不用改动；粘性表本身仍被管理面板快照使用。若日后确认面板也
+// 不再需要，可以连同 rotateZenSessionsOnce 一起删除。
+func startZenSessionRotator() {}

@@ -32,9 +32,11 @@ import (
 //	CLIENT_IP_HEADER           反代部署下取真实客户端 IP 的请求头名（登录限流用）
 //	ZEN_KEYS                   opencode zen 多 key，逗号分隔，配置为空时注入
 //	ZEN_PIN_KEY                zen key 池固定用第 n 个 key（1 起），排障/单 key 直测用
+//	ZEN_ORG_ID                 OAuth 账户组织 ID，写入 x-opencode-org-id 头；原始
+//	                           API key 流量不需要（官方 CLI 也只对 OAuth 账户发该头）
 //	ZEN_SESSION_ROTATE_MINUTES zen 粘性会话轮换周期（分钟），默认 120（2 小时）；
-//	                           0 = 关闭轮换。老会话久未更新会让上游首个请求变慢，
-//	                           定期本地重铸可规避（零成本：不触发上游、无子进程）
+//	                           0 = 关闭轮换。自 2026-10-27 起上游调用改为每次 API
+//	                           调用现铸会话，粘性表仅管理面板展示用，轮换已停用
 //	CLINE_ACCOUNTS_SEED_FILE   cline 账号种子文件（[{refreshToken,email}] JSON 数组），
 //	                           池为空时启动自动导入
 //	CLINE_USE_PROXIES          true 时 cline 上游全部走出口代理池（zen 上游配置
