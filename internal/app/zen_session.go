@@ -11,13 +11,23 @@ import (
 	"cline-go-proxy/internal/kit"
 )
 
-// ============ zen 会话粘性（sticky session） ============
+// ============ zen 会话（2026-10-27 起：每次 API 调用全新） ============
 //
-// 背景（2026-10-09 实测结论）：zen 免费层的会话门是无状态的格式检查——
-// 会话 ID 匹配 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$ 即放行。服务端既不检查
-// "见过此 ID"，也不检查时间戳新鲜度：本地铸造的合法格式 ID 三次直连通过
-// （含复用），而旧 sess_ 随机占位因格式不符必然 403 FreeTierError。
-// （早期"只有 CLI 收割的会话能用"的结论是被占位 ID 的坏格式混淆了。）
+// 背景（2026-10-09 实测结论，已被 2026-10-27 观察取代）：zen 免费层的
+// 会话门曾被认为是无状态的格式检查——会话 ID 匹配
+// ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$ 即放行。服务端既不检查"见过此 ID"，
+// 也不检查时间戳新鲜度：本地铸造的合法格式 ID 三次直连通过（含复用），
+// 而旧 sess_ 随机占位因格式不符必然 403 FreeTierError。
+// （早期"只有 CLI 收割的会话能用"的结论是被占位 ID 的坏格式混淆了。)
+//
+// UPDATE 2026-10-27: that stateless conclusion no longer holds for
+// repeated traffic. Official CLI multi-observation
+// (cline-proxy-audit/cli-multi-observation-2026-10-27.md) shows a
+// session reused across unrelated history-less requests gets flagged
+// to midnight UTC after the first call passes, while a fresh session
+// per CLI run does not. Upstream calls therefore use zenCallIdentity
+// (fresh per API call) below; the sticky store below is legacy,
+// kept only for admin snapshot / rotator / tests.
 //
 // 因此每个 zen key 绑定一个稳定的本地铸造 ses_ ID（kit.MintZenSessionID，
 // 结构与 CLI 铸造字节兼容）+ 固定的 ai-sdk 形态 UA；msg_ 请求 ID 仍每次
@@ -257,8 +267,59 @@ func mintZenSessionEntryLocked(e *zenSessionEntry, now time.Time) {
 	}
 }
 
-// StickyZenIdentity 取 key 绑定的稳定身份：会话 ID 与 UA 跨请求复用，
-// 请求 ID 每次全新（与官方 CLI 语义一致：同会话内多 msg_）。
+// zenCallIdentity is the per-API-call identity used by upstream calls
+// since 2026-10-27. It mints one fresh session per user API call
+// (Cursor, ZCode, OpenClaw, Hermes, Test, compact, Anthropic — all go
+// through callZenAPI/callZenResponsesAPI, so all get this behaviour),
+// reuses that session only for retries of the SAME call, and mints a
+// new one if the key switches mid-call or a 403 forces a refresh.
+//
+// Why fresh per call, not sticky: official CLI v2.1.4 creates a fresh
+// session per `run` invocation; within a session it always sends full
+// history, and its first turn always includes title calls for that
+// session (see cline-proxy-audit/cli-multi-observation-2026-10-27.md).
+// The gateway's old sticky session (120 min, persisted, reused across
+// unrelated history-less requests) therefore never looks like a real
+// CLI session's 2nd call, and upstream flags that pattern to midnight
+// UTC after the first call passes — a shadow ban that costs a whole
+// day, for zero benefit, since IDEs/agents already send full history
+// in every request themselves. Fresh per call costs no extra upstream
+// calls (unlike title-call replication, which would triple traffic
+// against the free allowance), and it is compatible with stateless
+// OpenAI-style clients: history lives in messages, not in the session ID.
+// The request ID is still fresh per attempt (CLI semantics: many msg_
+// per session), while session/UA stay stable within one call.
+type zenCallIdentity struct {
+	byKey map[string][3]string // key -> (session, request, ua); request refreshed per attempt below
+}
+
+func newZenCallIdentity() *zenCallIdentity {
+	return &zenCallIdentity{byKey: map[string][3]string{}}
+}
+
+func (c *zenCallIdentity) forKey(key string) (sess, req, ua string) {
+	if v, ok := c.byKey[key]; ok {
+		// Same call, same key: same session, fresh request ID per attempt.
+		return v[0], kit.MintZenRequestID(), v[2]
+	}
+	sess, req, ua = kit.FreshZenIdentity()
+	c.byKey[key] = [3]string{sess, req, ua}
+	return sess, req, ua
+}
+
+// refresh drops the cached identity for key so the next attempt of
+// this call mints a fresh session (403 path). It does not touch the
+// legacy sticky store.
+func (c *zenCallIdentity) refresh(key string) {
+	delete(c.byKey, key)
+}
+
+// StickyZenIdentity is LEGACY since 2026-10-27: upstream calls no
+// longer use it (see zenCallIdentity above). It is kept for the admin
+// panel snapshot, the session rotator, and its tests, so those do not
+// break, but no new upstream code should call it.
+// It returns a key-bound stable identity: session ID and UA reused
+// across requests, request ID fresh each time.
 // 返回 (session, request, user-agent)。
 //
 // 会话老化轮换：条目年龄超过 SessionRotateMinutes 时重铸（同步、零成本）。

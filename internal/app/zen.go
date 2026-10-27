@@ -1840,6 +1840,10 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 	retryKey := ""          // 非空时重试沿用该 key（保持 key sess_ 一致）
 	remapped := false       // 410 弃用迁移至多一次，防别名链循环
 	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
+	// 2026-10-27: fresh session per API call (zenCallIdentity). Same
+	// session across retries of this call, fresh if the key switches
+	// or a 403 forces a refresh. See zen_session.go.
+	callIdent := newZenCallIdentity()
 
 	for attempt := 0; ; attempt++ {
 		// 先选 key：attempt==0 或尚无粘性 key 时轮转；重试链内沿用
@@ -1876,14 +1880,9 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 		if proxyURL != "" {
 			viaProxy = maskProxyURL(proxyURL)
 		}
-		sess, user, ua := "", "", ""
-		if key != "" {
-			// 会话粘性：同一 key 复用稳定的 sess_/UA（免费门校验 sess_ 格式，
-			// 稳定身份也利于上游侧一致性），msg_ 请求 ID 仍每次随机。
-			sess, user, ua = StickyZenIdentity(key)
-		} else {
-			sess, user, ua = kit.FreshZenIdentity()
-		}
+		// Fresh session per API call (2026-10-27): same session for
+		// retries of this call, fresh for a new call / new key.
+		sess, user, ua := callIdent.forKey(key)
 		body := buildZenResponsesBody(params, zm.ID, sess)
 		bodyJSON, err := json.Marshal(body)
 		if err != nil {
@@ -2014,9 +2013,9 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 			}
 			if !sessionRetried {
 				sessionRetried = true
-				log.Printf("  zen responses session rejected (403) [%s] key#%d: refreshing session locally, retry same key",
-					zenSessionDesc(key), keyIndex(key))
-				refreshZenSession(key)
+				log.Printf("  zen responses session rejected (403) [%s] key#%d: minting fresh session for this call, retry same key",
+					kit.Truncate(sess, 24), keyIndex(key))
+				callIdent.refresh(key)
 				continue
 			}
 			// 换新后仍 403：该 key 不可用，冷却 5 分钟后快速失败。
@@ -2089,23 +2088,37 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 	rateLimited := 0
 	remapped := false       // 410 弃用迁移至多一次，防别名链循环
 	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
+	// 2026-10-27: fresh session per API call (zenCallIdentity). Same
+	// session across retries of this call, fresh if the key switches
+	// or a 403 forces a refresh. See zen_session.go.
+	callIdent := newZenCallIdentity()
+	// retryKey pins the key for the duration of this call. Previously
+	// this was an emergent property of the sticky session: pickZenKey
+	// prefers keys with a live session, so a 403 retry naturally stayed
+	// on the same key. With fresh sessions there is no live session to
+	// prefer, so without this pin a 403 retry would round-robin to the
+	// next key and fan a single session failure out across the pool.
+	// Rate-limit switching (below) is the only branch that rewrites it,
+	// mirroring callZenResponsesAPI.
+	retryKey := ""
 
 	for attempt := 0; ; attempt++ {
-		// 客户端身份：会话粘性——同一 key 复用稳定的会话 ID/UA（免费门是
-		// sess_ 格式校验而非服务端绑定，粘住身份仍利于上游侧一致性），
-		// msg_ 请求 ID 每次随机。
+		// 客户端身份：每次 API 调用全新会话（2026-10-27，见 zen_session.go），
+		// 同一调用的重试沿用同一会话，msg_ 请求 ID 每次随机。
 		// ZEN_PIN_KEY=n 时固定用第 n 个 key（单 key 直测/排障），默认轮转。
 		// pinKey（面板 Test）优先且不碰轮转指针：一次探测不该挪动 round-robin
 		// 的游标，否则每点一次 Test 都会让下一次正常请求换 key。
 		var key string
 		if o.pinKey != "" {
 			key = o.pinKey
-		} else {
-			key = pickZenKey()
-			if pk := pinnedZenKey(); pk != "" {
-				key = pk
-			}
+			retryKey = o.pinKey
+		} else if pk := pinnedZenKey(); pk != "" {
+			key = pk
+			retryKey = pk
+		} else if retryKey == "" {
+			retryKey = pickZenKey()
 		}
+		key = retryKey
 		// 出口在 key 之后选：绑定策略下一个 key 固定一个代理，按请求轮转
 		// 会让同一个 key 从多个 IP 出去——2026-10-21 起 zen 按 key 记录出口，
 		// 这正是它判定"整池 key 可疑"的指纹。
@@ -2124,7 +2137,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 		if err != nil {
 			return nil, rateLimited, fmt.Errorf("create zen request: %w", err)
 		}
-		sess, user, ua := StickyZenIdentity(key)
+		// Fresh session per API call (2026-10-27, see zenCallIdentity).
+		sess, user, ua := callIdent.forKey(key)
 		req.Header.Set("Authorization", "Bearer "+key)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", ua)
@@ -2190,6 +2204,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 			}
 			if next := pickZenKey(); next != "" && next != key && !zenKeyCooling(next) {
 				log.Printf("  zen rate limited (%d), switching to next zen key (%d configured)", resp.StatusCode, len(cfg.Keys))
+				key = next
+				retryKey = next
 				continue
 			}
 			if attempt < retries {
@@ -2228,14 +2244,14 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 			// 门禁收紧"的证据；换新频率升高即是 tripwire。
 			// pinKey（面板 Test）：探测结论只属于这次点击，不触碰会话状态。
 			if o.pinKey != "" {
-				log.Printf("  zen chat session rejected (403) [%s], key#%d (probe: no state change)", zenSessionDesc(key), keyIndex(key))
+				log.Printf("  zen chat session rejected (403) [%s], key#%d (probe: no state change)", kit.Truncate(sess, 24), keyIndex(key))
 				return nil, rateLimited, apiErr
 			}
 			if !sessionRetried {
 				sessionRetried = true
-				log.Printf("  zen chat session rejected (403) [%s] key#%d: refreshing session locally, retry same key",
-					zenSessionDesc(key), keyIndex(key))
-				refreshZenSession(key)
+				log.Printf("  zen chat session rejected (403) [%s] key#%d: minting fresh session for this call, retry same key",
+					kit.Truncate(sess, 24), keyIndex(key))
+				callIdent.refresh(key)
 				continue
 			}
 			zenSessionFailed(key)
