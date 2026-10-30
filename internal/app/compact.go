@@ -369,7 +369,7 @@ func maybeCompact(params map[string]any, m *ZenModel, sessionID string) compactO
 	output := m.Output
 	buffer := cfg.Compaction.Buffer
 	if buffer <= 0 {
-		buffer = 20000
+		buffer = defaultCompactBuffer
 	}
 	keep := cfg.Compaction.KeepTokens
 	if keep <= 0 {

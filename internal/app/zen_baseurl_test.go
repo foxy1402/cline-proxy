@@ -92,3 +92,37 @@ func TestApplyZenRegistryBase(t *testing.T) {
 		}
 	}
 }
+
+// 存量配置的压缩 buffer 迁移：旧默认 20000 必须被抬到 80000，否则升级后
+// 压缩仍然永不触发（200k/32k 模型阈值 168k > 128k 客户端上限）。
+func TestLoadZenConfigMigratesLegacyCompactBuffer(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DATA_DIR", dir)
+	path := filepath.Join(dir, ".zen-config.json")
+	body := `{"enabled":true,"key":"public","keys":["public"],"compaction":{"auto":true,"buffer":20000,"keepTokens":8000,"maxSummary":4096}}`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadZenConfig()
+	if cfg.Compaction.Buffer != defaultCompactBuffer {
+		t.Fatalf("buffer = %d, want migrated %d", cfg.Compaction.Buffer, defaultCompactBuffer)
+	}
+	// 其余压缩字段不得被迁移逻辑碰掉
+	if cfg.Compaction.KeepTokens != 8000 || cfg.Compaction.MaxSummary != 4096 || !cfg.Compaction.Auto {
+		t.Fatalf("migration clobbered other compaction fields: %+v", cfg.Compaction)
+	}
+}
+
+// 显式调过的 buffer 绝不能被迁移覆盖。
+func TestLoadZenConfigKeepsCustomCompactBuffer(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DATA_DIR", dir)
+	path := filepath.Join(dir, ".zen-config.json")
+	body := `{"enabled":true,"key":"public","keys":["public"],"compaction":{"auto":true,"buffer":45000}}`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadZenConfig().Compaction.Buffer; got != 45000 {
+		t.Fatalf("custom buffer rewritten to %d, want 45000", got)
+	}
+}

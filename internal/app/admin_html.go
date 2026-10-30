@@ -623,7 +623,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>Auto-compaction</label>
         <select id="ocCompactAuto"><option value="true">On</option><option value="false">Off</option></select>
       </div>
-      <div class="field"><label>Reserved buffer</label><input type="text" id="ocCompactBuffer" placeholder="20000"></div>
+      <div class="field"><label>Reserved buffer</label><input type="text" id="ocCompactBuffer" placeholder="80000"></div>
     </div>
     <div class="form-row">
       <div class="field"><label>Tail tokens kept</label><input type="text" id="ocKeepTokens" placeholder="8000"></div>
@@ -1329,7 +1329,7 @@ async function loadOcConfig() {
               (un > 0 ? ' · ' + un + ' key' + (un === 1 ? '' : 's') + ' skipped' : '') + '</span>');
     }
     _('ocCompactAuto').value = String(c.compaction ? c.compaction.auto : true);
-    _('ocCompactBuffer').value = c.compaction ? c.compaction.buffer : 20000;
+    _('ocCompactBuffer').value = c.compaction ? c.compaction.buffer : 80000;
     _('ocKeepTokens').value = c.compaction ? c.compaction.keepTokens : 8000;
     _('ocSummaryModel').value = c.compaction ? (c.compaction.summaryModel || '') : '';
     _('ocMaxSummary').value = c.compaction ? c.compaction.maxSummary : 4096;
@@ -1362,7 +1362,7 @@ async function saveOcConfig() {
     pinProxyPerKey: _('ocPinProxy') ? _('ocPinProxy').value === 'true' : true,
     compaction: {
       auto: _('ocCompactAuto').value === 'true',
-      buffer: parseInt(_('ocCompactBuffer').value) || 20000,
+      buffer: parseInt(_('ocCompactBuffer').value) || 80000,
       keepTokens: parseInt(_('ocKeepTokens').value) || 8000,
       summaryModel: _('ocSummaryModel').value.trim(),
       maxSummary: parseInt(_('ocMaxSummary').value) || 4096

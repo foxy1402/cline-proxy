@@ -108,6 +108,42 @@ Not verified against a live 200: the sacrifice key was already quota-exhausted
 returned 429. The path fix is verified against the catalog and the CLI capture,
 not against an accepted request.
 
+**Later that day this was verified live.** A second account on a different egress
+(WireGuard, 140.245.39.225) made 11 gateway calls — big-pickle streaming,
+non-streaming and tool-calling, plus deepseek/glm/mimo/nemotron/beam/flint/vl —
+all `attempt=1`, all 200, zero 429s and zero 403s. The CLI succeeded on the same
+key from the same IP, and the gateway still worked afterwards. So the gateway is
+not being fingerprinted or shadow-banned: earlier "whole-day bans" were the daily
+free allowance actually being spent, magnified by the retry amplification below.
+
+### 2026-10-30 — a 429 fan-out bug that looked exactly like a ban
+
+A user report of "one OpenClaw message flagged all 6 keys for a whole day" was not
+a flag. The log falsified it within one line: `key#5` returned **200** at 02:12:28
+and **429** at 02:13:14, same key, same egress IP, 46 seconds apart. A flagged key
+does not un-flag itself. It was quota — `FreeUsageLimitError` (429), not the
+`FreeTierError` 403 class a content/gate rejection produces.
+
+Two defects turned that one rate-limited request into apparent pool-wide death:
+
+1. **Unbounded 429 key fan-out.** The switch-key branch did `continue`, which
+   skipped the `attempt < retries` guard, inside a `for attempt := 0; ; attempt++`
+   loop with no upper bound. One 291-message request cooled five keys in four
+   seconds, each pinned until the next 00:00 UTC. Fixed with a separate
+   `max429KeySwitches` budget (switching keys freezes one irreversibly; sleeping
+   does not, so the two must not share a counter). A request now cools at most
+   `1 + retries` keys and logs `key-switch budget exhausted` when it stops.
+
+2. **Compaction never fired for clients with a lower cap than the model window.**
+   The threshold is `context − max(output, buffer)`: 200k/32k gave 168k, while
+   OpenClaw caps input at 128k, so full-size requests went upstream untouched.
+   `buffer` now defaults to 80000 (threshold 120k for the 200k/32k class); large
+   output models are unaffected because `max(output, buffer)` is output-dominated.
+   A saved config holding exactly 20000 is migrated; custom values are kept.
+
+Both are covered by regression tests (`zen_fanout_test.go`), including the
+12-key pool case that previously cooled the entire pool.
+
 Also fixed from the same audit: `refreshZenSession` no longer skips `key ==
 "public"` — that exemption made the keyless-pool 403 retry byte-identical and
 therefore a silent no-op.

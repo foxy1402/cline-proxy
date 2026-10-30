@@ -86,6 +86,29 @@ const zenStaleBase = "https://opencode.ai/inference/v1"
 // zenLegacyBase 已废弃的旧基地址，仅用于存量配置迁移识别。
 const zenLegacyBase = "https://opencode.ai/zen/v1"
 
+// max429KeySwitches 一次客户端请求因 429 最多切换几个 key 的硬上限。
+//
+// 换 key 是本次调用里唯一不可逆的操作：cooldownZenKey 会把该 key 冻结到
+// Retry-After（可长达 24h，见 maxCooldown）。若不设上限，一个大请求 429 后
+// 沿池顺序把每个 key 逐个冷却，整池在几秒内报废——2026-10-30 实测：单个
+// 291 条消息的请求 4 秒内冷却了 5 个 key。上限取 4（实际生效值再与
+// retries 取小），保证一次坏请求最多牺牲少数几个 key，而不是整个池。
+const max429KeySwitches = 4
+
+// legacyCompactBuffer 压缩 buffer 的历史默认值，仅用于存量配置迁移。
+const legacyCompactBuffer = 20000
+
+// defaultCompactBuffer 压缩预留缓冲（token）。20000 的旧默认值对"客户端自身
+// 上限低于模型窗口"的场景无效：阈值 = ctx - max(output, buffer)，200k 窗口、
+// 32k 输出时阈值 168k，而客户端（OpenClaw 等）可能在 128k 就封顶——压缩永远
+// 不会触发，网关把满载请求原样送上游。
+//
+// 80000 让 200k/32k 这类模型的阈值降到 120k，落进 128k 客户端上限之内；
+// 大窗口模型（beam 1M、nemotron-lightning 262k/262k）仍由 max(output, buffer)
+// 主导，行为不变。压缩本身保留 8000 token 尾部（keepTokens），所以抬高 buffer
+// 只是"更早开始摘要"，不会让上下文变浅。
+const defaultCompactBuffer = 80000
+
 func initZenModels() {
 	zenModelsMu.Lock()
 	defer zenModelsMu.Unlock()
@@ -299,7 +322,7 @@ func defaultZenConfig() *zenConfigData {
 		PinProxyPerKey: boolPtr(true),
 		Compaction: zenCompactConfig{
 			Auto:       true,
-			Buffer:     20000,
+			Buffer:     defaultCompactBuffer,
 			KeepTokens: 8000,
 			MaxSummary: 4096,
 		},
@@ -469,6 +492,14 @@ func loadZenConfig() *zenConfigData {
 	if strings.TrimRight(cfg.BaseURL, "/") == zenStaleBase {
 		cfg.BaseURL = zenAPIBase
 		log.Printf("zen baseURL migrated: %s -> %s (upstream moved the free-tier path under /openai)", zenStaleBase, zenAPIBase)
+	}
+	// 存量配置迁移：压缩 buffer 旧默认 20000 对"客户端上限低于模型窗口"的
+	// 场景无效（200k/32k 模型 -> 阈值 168k，而客户端可能 128k 就封顶，
+	// 压缩永不触发）。只迁移恰好等于旧默认值的配置；显式调过的不动。
+	if cfg.Compaction.Buffer == legacyCompactBuffer {
+		cfg.Compaction.Buffer = defaultCompactBuffer
+		log.Printf("zen compaction buffer migrated: %d -> %d (old value never fired below a 128k client cap)",
+			legacyCompactBuffer, defaultCompactBuffer)
 	}
 	return cfg
 }
@@ -1970,6 +2001,13 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 	retryKey := ""          // 非空时重试沿用该 key（保持 key sess_ 一致）
 	remapped := false       // 410 弃用迁移至多一次，防别名链循环
 	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
+	// keySwitches 限制"一次客户端请求最多冷却几个 key"（同 chat 路径，
+	// 见 callZenAPI 里的说明：换 key 会不可逆地冷却 key，必须单独设上限）。
+	keySwitches := 0
+	maxKeySwitches := retries
+	if maxKeySwitches > max429KeySwitches {
+		maxKeySwitches = max429KeySwitches
+	}
 	// 2026-10-27: fresh session per API call (zenCallIdentity). Same
 	// session across retries of this call, fresh if the key switches
 	// or a 403 forces a refresh. See zen_session.go.
@@ -2104,13 +2142,20 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 			if o.pinKey != "" {
 				return nil, rateLimited, apiErr
 			}
-			if next := pickZenKey(); next != "" && next != key && !zenKeyCooling(next) {
-				// 必须同步改写 retryKey：循环头 key=retryKey，只改 key 不改
-				// retryKey 会让下一次迭代继续用刚冷却的旧 key，无限 429 空转。
-				key = next
-				retryKey = next
-				log.Printf("  zen responses rate limited (%d), switching to next zen key (%d configured)", resp.StatusCode, len(cfg.Keys))
-				continue
+			if keySwitches < maxKeySwitches {
+				if next := pickZenKey(); next != "" && next != key && !zenKeyCooling(next) {
+					// 必须同步改写 retryKey：循环头 key=retryKey，只改 key 不改
+					// retryKey 会让下一次迭代继续用刚冷却的旧 key，无限 429 空转。
+					log.Printf("  zen responses rate limited (%d), switching to next zen key (%d configured, switch %d/%d)",
+						resp.StatusCode, len(cfg.Keys), keySwitches+1, maxKeySwitches)
+					key = next
+					retryKey = next
+					keySwitches++
+					continue
+				}
+			} else if len(cfg.Keys) > keySwitches+1 {
+				log.Printf("  zen responses rate limited (%d): key-switch budget exhausted (%d/%d) with %d key(s) configured, not cooling the rest",
+					resp.StatusCode, keySwitches, maxKeySwitches, len(cfg.Keys))
 			}
 			if attempt < retries {
 				wait := delay
@@ -2223,6 +2268,23 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 	rateLimited := 0
 	remapped := false       // 410 弃用迁移至多一次，防别名链循环
 	sessionRetried := false // FreeTier 403 换新会话后同 key 重试至多一次
+	// keySwitches 限制"一次客户端请求最多冷却几个 key"。
+	//
+	// 2026-10-30 实测事故：一个 291 条消息的大请求 429 后，下面的换 key 分支
+	// 用 `continue` 绕过了 `attempt < retries` 判断，而循环头是 `for attempt := 0; ;`
+	// 无上界——结果 4 秒内把池里 5 个 key 全部冷却到 24h（maxCooldown）。
+	// 一次请求的规模问题因此被放大成"整池被封"的假象。
+	//
+	// 语义区分：睡眠重试（attempt < retries）是"等一等再用同一个 key"，成本低；
+	// 换 key 会永久冷却一个 key，成本高且不可逆。故单独计数、单独设上限，
+	// 不占用重试预算：keySwitches 上限 = retries（默认 3），即一次请求最多
+	// 触碰 1 + 3 = 4 个 key，最多冷却 4 个。这与"重试次数"是两件事，
+	// 不能共用一个计数器。
+	keySwitches := 0
+	maxKeySwitches := retries
+	if maxKeySwitches > max429KeySwitches {
+		maxKeySwitches = max429KeySwitches
+	}
 	// 2026-10-27: fresh session per API call (zenCallIdentity). Same
 	// session across retries of this call, fresh if the key switches
 	// or a 403 forces a refresh. See zen_session.go.
@@ -2342,11 +2404,21 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 			if o.pinKey != "" {
 				return nil, rateLimited, apiErr
 			}
-			if next := pickZenKey(); next != "" && next != key && !zenKeyCooling(next) {
-				log.Printf("  zen rate limited (%d), switching to next zen key (%d configured)", resp.StatusCode, len(cfg.Keys))
-				key = next
-				retryKey = next
-				continue
+			if keySwitches < maxKeySwitches {
+				if next := pickZenKey(); next != "" && next != key && !zenKeyCooling(next) {
+					log.Printf("  zen rate limited (%d), switching to next zen key (%d configured, switch %d/%d)",
+						resp.StatusCode, len(cfg.Keys), keySwitches+1, maxKeySwitches)
+					key = next
+					retryKey = next
+					keySwitches++
+					continue
+				}
+			} else if len(cfg.Keys) > keySwitches+1 {
+				// 还有没用过的 key，但本次请求的换 key 预算已用完。必须明确
+				// 记一行：否则表现为"明明还有 key 却直接 429 返回"，排查时
+				// 会误以为是 key 池配置问题。
+				log.Printf("  zen rate limited (%d): key-switch budget exhausted (%d/%d) with %d key(s) configured, not cooling the rest",
+					resp.StatusCode, keySwitches, maxKeySwitches, len(cfg.Keys))
 			}
 			if attempt < retries {
 				// Retry-After 封顶 30s：更长的等待没有意义（槽位被占、客户端早已离开）

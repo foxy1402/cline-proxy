@@ -143,6 +143,10 @@ The zen route table is seeded deterministically from the model catalog's SDK pac
 
 The upstream base URL is `https://opencode.ai/inference/openai/v1`. It is not guessed: every catalog sync reads the opencode provider's `api` field from `models.opencode.ai` (the same data the real CLI reads) and corrects the saved config to match — but only when that config still holds the project default. A URL you typed into the admin panel is treated as deliberate and never rewritten. The sync refuses any value that is not `https://opencode.ai/inference/…`, so a tampered catalog response cannot redirect a request carrying your `Authorization` header.
 
+A 429 cools the key that hit it for the upstream `Retry-After` (capped at 24h, since the value usually points at the daily reset). One client request may cool at most `1 + retries` keys — default 5 — because switching keys is irreversible while waiting is not. Without that bound a single oversized request walks the whole pool and cools every key in seconds; the log line `key-switch budget exhausted` marks where it stopped.
+
+Context compaction fires at `context − max(output, buffer)` tokens, with `buffer` defaulting to 80000. The old 20000 never fired for a 200k-window / 32k-output model when the client itself caps input around 128k, so full-size requests went upstream untouched. Raise `buffer` further if your client's cap is lower than `context − 80000`; a saved config still holding exactly 20000 is migrated automatically, and any other value you set is left alone.
+
 On load, a saved config pointing at one of the two historical defaults is migrated and logged as `zen baseURL migrated: …`: `https://opencode.ai/zen/v1` (the pre-2026-10 console shim, which strips the validated headers and 403s anonymous free-tier traffic) and `https://opencode.ai/inference/v1` (a stale default that omitted the `/openai` segment — corrected 2026-10-30 after capturing the CLI's real traffic).
 
 | Variable | Default | Description |
