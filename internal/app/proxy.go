@@ -637,7 +637,7 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	}
 
 	if isStream {
-		handleStreamResponseWithUsage(w, resp, usageFn)
+		handleStreamResponseUsage(w, resp, usageFn, clientWantsStreamUsage(params))
 		tracker.finish(true, resp.StatusCode)
 		return
 	}
@@ -1273,7 +1273,43 @@ func getMsgCount(params map[string]any) int {
 	return 0
 }
 
+// handleStreamResponseWithUsage 默认不透传纯 usage 收尾帧（cline 路径从不向
+// 上游要 include_usage，也不该凭空多给客户端一帧）。
 func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
+	handleStreamResponseUsage(w, upstream, onUsage, false)
+}
+
+// clientWantsStreamUsage 客户端是否自己要求了流式 usage 帧
+// （stream_options.include_usage）。zen 路径为了统计恒向上游要该帧，只有客户端
+// 要了才原样透传。
+func clientWantsStreamUsage(params map[string]any) bool {
+	so, ok := params["stream_options"].(map[string]any)
+	if !ok {
+		return false
+	}
+	v, _ := so["include_usage"].(bool)
+	return v
+}
+
+// isUsageOnlyChunk 判断一帧是否为 stream_options.include_usage 产生的纯 usage 帧：
+// choices 为空数组（或缺失）且带 usage。
+func isUsageOnlyChunk(obj map[string]any) bool {
+	u, ok := obj["usage"].(map[string]any)
+	if !ok || len(u) == 0 {
+		return false
+	}
+	raw, present := obj["choices"]
+	if !present || raw == nil {
+		return true
+	}
+	choices, _ := raw.([]any)
+	return len(choices) == 0
+}
+
+// handleStreamResponseUsage 流式转发上游 SSE。keepUsageOnly 决定是否把纯 usage
+// 收尾帧也下发给客户端：zen 路径为统计向上游要 include_usage，客户端没要时不能
+// 多给它一帧没预期的数据。
+func handleStreamResponseUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), keepUsageOnly bool) {
 	// Check Flusher support BEFORE writing any headers
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1407,6 +1443,14 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 						onUsage(u)
 					}
+				}
+				// 纯 usage 收尾帧：zen 路径为拿 token 统计恒向上游要
+				// stream_options.include_usage，上游因此在末尾补一帧 choices=[]。
+				// 客户端自己没要 usage 时这帧是网关引入的额外数据，吞掉；要了就
+				// 原样透传（keepUsageOnly）。
+				if !keepUsageOnly && isUsageOnlyChunk(obj) {
+					flusher.Flush()
+					continue
 				}
 				// Some Cline responses wrap in {data: {...}}
 				if data, ok := obj["data"]; ok {

@@ -68,12 +68,20 @@ var (
 	zenAliases  = make(map[string]*ZenModel) // 别名表
 )
 
-// zenAPIBase 上游基地址。2026-10-15 实测：官方目录（models.opencode.ai）
-// 已把 opencode provider 的 api 指向 /inference/v1，CLI 直连新后端；旧
-// /zen/v1 经 console 中转后匿名免费请求恒 403 FreeTierError（中转剥
-// Authorization 并改名 x-opencode-request，校验无法通过），故默认与存量
-// 配置一并迁移到 /inference/v1（见 loadZenConfig 的迁移逻辑）。
-const zenAPIBase = "https://opencode.ai/inference/v1"
+// zenAPIBase 上游基地址（编译期默认值）。
+//
+// 2026-10-30 抓包更正：官方目录（models.opencode.ai）里 opencode provider 的
+// api 是 /inference/openai/v1，全部 8 个免费模型的 provider.api 也一致；真实
+// CLI 2.1.4 发往 /inference/openai/v1/chat/completions。此前这里写死的
+// /inference/v1 来自 2026-10-15 的一次观测，上游改了路径而仓库没跟——差一个
+// 路径段。默认值已同步，并且 syncZenModels 会按目录里的 provider.api 自愈
+// （见 applyZenRegistryBase），不再依赖某次人工观测。
+const zenAPIBase = "https://opencode.ai/inference/openai/v1"
+
+// zenStaleBase 2026-10-15 ~ 2026-10-30 期间的（错误的）编译期默认值。
+// 仅用于识别并迁移存量的 .zen-config.json：用户没改过 baseURL 时它被写进了
+// 配置文件，不迁移的话旧安装会一直停在短路径上。
+const zenStaleBase = "https://opencode.ai/inference/v1"
 
 // zenLegacyBase 已废弃的旧基地址，仅用于存量配置迁移识别。
 const zenLegacyBase = "https://opencode.ai/zen/v1"
@@ -455,6 +463,12 @@ func loadZenConfig() *zenConfigData {
 	if strings.TrimRight(cfg.BaseURL, "/") == zenLegacyBase {
 		cfg.BaseURL = zenAPIBase
 		log.Printf("zen baseURL migrated: %s -> %s (legacy zen endpoint rejects anonymous free-tier traffic)", zenLegacyBase, zenAPIBase)
+	}
+	// 存量配置迁移：2026-10-15 的错误默认值 /inference/v1 少了 /openai 一段。
+	// 同样只迁移恰好等于该旧默认值的配置——显式填过自定义地址的不动。
+	if strings.TrimRight(cfg.BaseURL, "/") == zenStaleBase {
+		cfg.BaseURL = zenAPIBase
+		log.Printf("zen baseURL migrated: %s -> %s (upstream moved the free-tier path under /openai)", zenStaleBase, zenAPIBase)
 	}
 	return cfg
 }
@@ -869,6 +883,12 @@ func zenGateTools() []any {
 					"name":        d.Name,
 					"description": d.Description,
 					"parameters":  d.ParametersChat,
+					// CLI 2.1.4 抓包：12 个 gate 工具的 function 里都带
+					// "strict": false。responses 路径一直有该字段
+					// （zenMergeResponsesTools），chat 路径漏了——同一份工具集
+					// 在两条路径上形态不一致，补齐。语义上 strict 缺省即 false，
+					// 这里是形态对齐而非行为改变。
+					"strict": false,
 				},
 			})
 		}
@@ -881,6 +901,7 @@ func zenGateTools() []any {
 				"name":        s.name,
 				"description": s.desc,
 				"parameters":  zenEmptySchema(),
+				"strict":      false,
 			},
 		})
 	}
@@ -902,10 +923,40 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 	}
 	if stream {
 		body["stream"] = true
+		// CLI 2.1.4 在 chat 路径恒发 {"include_usage":true}（2026-10-30 抓包）。
+		// 上游只有收到该字段才会在 SSE 末尾补一帧纯 usage 块——不发的话网关的
+		// 流式 token 统计恒为 0（onUsage 从来收不到数据）。这一帧不带 choices，
+		// 客户端的 OpenAI 解析器会忽略它，形态安全。
+		//
+		// 在客户端给的对象上合并而不是整体替换：客户端若传了别的
+		// stream_options 子键，不该因为网关要统计就丢掉。客户端显式写
+		// include_usage:false 时仍改为 true —— 网关需要该帧做统计，而下发时
+		// 会按客户端的原始意愿吞掉它（见 clientWantsStreamUsage）。
+		so := map[string]any{"include_usage": true}
+		if cs, ok := params["stream_options"].(map[string]any); ok {
+			for k, v := range cs {
+				if k != "include_usage" {
+					so[k] = v
+				}
+			}
+		}
+		body["stream_options"] = so
+	} else {
+		// 非流式路径不该带上流式专有字段（passThroughKeys 会原样搬过来）。
+		delete(body, "stream_options")
 	}
 	if model, ok := params["model"].(string); ok {
 		if m, ok := resolveZenModel(model); ok {
 			body["model"] = m.ID
+			// 输出上限默认值：CLI 2.1.4 对 big-pickle 发 max_completion_tokens
+			// =32000，正是目录里该模型的 limit.output（2026-10-30 抓包 + 目录
+			// 核对一致）。网关此前完全不发该字段——上游用自己更大的缺省值，
+			// 与真实客户端形态不同。客户端显式给了就尊重客户端的值。
+			if _, has := body["max_completion_tokens"]; !has {
+				if _, hasTok := body["max_tokens"]; !hasTok && m.Output > 0 {
+					body["max_completion_tokens"] = m.Output
+				}
+			}
 		}
 	}
 	delete(body, "reasoning_effort")
@@ -2460,30 +2511,34 @@ type zenModelOverlay struct {
 }
 
 // fetchZenRegistry 拉取公共目录 api.json，返回（限额 overlay、价格门集合、
-// 是否可达）。价格门 = cost.input==0 && cost.output==0 且 status 非
-// deprecated。模型 ID 以条目内 id 优先、map key 兜底。目录不可达返回
-// (空, 空, false)，调用方按 fail-open 处理。
+// provider 级 api 基地址、是否可达）。价格门 = cost.input==0 && cost.output==0
+// 且 status 非 deprecated。模型 ID 以条目内 id 优先、map key 兜底。目录不可达
+// 返回 (空, 空, "", false)，调用方按 fail-open 处理。
+// providerAPI 是 opencode provider 的 api 字段——免费层真正的上游基地址。
+// 它此前只存在于一次人工观测里（见 zenAPIBase 的注释），现在每次目录同步都
+// 重新取一遍，供 applyZenRegistryBase 校正默认值。
 // 唯一实现：syncZenModels 使用（会话铸造改本地后不再有第二消费者），
 // 避免两处价格门逻辑漂移。
-func fetchZenRegistry() (map[string]zenModelOverlay, map[string]bool, bool) {
+func fetchZenRegistry() (map[string]zenModelOverlay, map[string]bool, string, bool) {
 	overlay := map[string]zenModelOverlay{}
 	freeGate := map[string]bool{}
 	oreq, err := http.NewRequest("GET", zenRegistryURL, nil)
 	if err != nil {
-		return overlay, freeGate, false
+		return overlay, freeGate, "", false
 	}
 	oreq.Header.Set("User-Agent", "opencode/latest/cli")
 	client := &http.Client{Timeout: 25 * time.Second}
 	oresp, err := client.Do(oreq)
 	if err != nil {
-		return overlay, freeGate, false
+		return overlay, freeGate, "", false
 	}
 	defer oresp.Body.Close()
 	if oresp.StatusCode != 200 {
-		return overlay, freeGate, false
+		return overlay, freeGate, "", false
 	}
 	var payload map[string]struct {
 		NPM    string `json:"npm"`
+		API    string `json:"api"`
 		Models map[string]struct {
 			ID         string `json:"id"`
 			Status     string `json:"status"`
@@ -2509,11 +2564,11 @@ func fetchZenRegistry() (map[string]zenModelOverlay, map[string]bool, bool) {
 	// 体积上限：目录正常约几百 KB，恶意/异常响应不应无界读入内存。
 	// 超限即视为不可达（fail-open 的调用方保留上次目录）。
 	if json.NewDecoder(io.LimitReader(oresp.Body, maxRegistryBytes+1)).Decode(&payload) != nil {
-		return overlay, freeGate, false
+		return overlay, freeGate, "", false
 	}
 	prov, ok := payload["opencode"]
 	if !ok {
-		return overlay, freeGate, false
+		return overlay, freeGate, "", false
 	}
 	for id, m := range prov.Models {
 		if m.ID != "" {
@@ -2541,7 +2596,54 @@ func fetchZenRegistry() (map[string]zenModelOverlay, map[string]bool, bool) {
 			freeGate[id] = true
 		}
 	}
-	return overlay, freeGate, true
+	return overlay, freeGate, strings.TrimRight(strings.TrimSpace(prov.API), "/"), true
+}
+
+// applyZenRegistryBase 用目录里的 provider.api 校正 zen 上游基地址。
+//
+// 背景：zenAPIBase 是编译期常量，而免费层的路径已经改过一次（/zen/v1 →
+// /inference/v1 → /inference/openai/v1），每次都靠人工观测再改代码，期间网关
+// 一直打在已经不存在的旧路径上。目录本身就是这个地址的唯一权威（真实 CLI
+// 也读同一份数据），所以每次目录同步都拿它校正一次。
+//
+// 三条纪律：
+//   - 只在基地址仍等于"本项目的默认值"时校正。用户在面板里显式填过别的
+//     地址（自建中转、抓包代理）就绝不动它——那是明确的意图，不是过时的
+//     观测。
+//   - 只接受 https://opencode.ai/inference/... 的值。目录是远端数据，不能让
+//     一个被污染或中间人改写的响应把带 Authorization 的流量导去任意主机，也
+//     不能把它指回已失效的 /zen/v1（匿名流量在那里恒 403）。
+//   - 写盘时走 setZenConfig 的既有路径（含 saveZenConfig 的原子写），并留日志。
+//
+// 返回是否发生校正。
+func applyZenRegistryBase(registryAPI string, current string) bool {
+	want := strings.TrimRight(strings.TrimSpace(registryAPI), "/")
+	if want == "" {
+		return false
+	}
+	// 目录给的是顶级 provider api；免费模型都在 /inference/openai/v1 下。
+	// 只接受 https://opencode.ai/inference/...：既避免把凭据送去别处，也避免
+	// 被篡改的目录把基地址指回已失效的 /zen/v1（匿名流量在那里恒 403）。
+	u, err := url.Parse(want)
+	if err != nil || u.Scheme != "https" || !strings.EqualFold(u.Host, "opencode.ai") ||
+		!strings.HasPrefix(u.Path, "/inference/") {
+		log.Printf("zen registry api ignored (not https://opencode.ai/inference/...): %q", kit.Truncate(want, 120))
+		return false
+	}
+	cur := strings.TrimRight(strings.TrimSpace(current), "/")
+	// 只覆盖"仍是默认值"的情形：zenAPIBase（当前默认）与 zenStaleBase
+	// （上一版默认，已由 loadZenConfig 迁移，这里兜住运行期改目录的情况）。
+	if cur != zenAPIBase && cur != zenStaleBase {
+		return false
+	}
+	if cur == want {
+		return false
+	}
+	cfg := *getZenConfig()
+	cfg.BaseURL = want
+	setZenConfig(&cfg)
+	log.Printf("zen baseURL corrected from registry: %s -> %s", cur, want)
+	return true
 }
 
 // zenNPMToUpstream 把 SDK 包名映射到上游路由种子（与官方 CLI 的 resolveSDK
@@ -2591,17 +2693,21 @@ func zenDesiredFromLive(registryOK bool, freeGate map[string]bool) (map[string]b
 //     内嵌 CLI 的成员表兜底已随收割机一起移除。
 //  3. 限额 overlay：目录 limit.context/output + tool_call / reasoning /
 //     attachment 旗标 + per-model provider.npm（端点种子，见 applyZenCatalog）。
+//  4. 上游基地址：目录 provider.api 与"仍是默认值"的配置不符时自动校正
+//     （见 applyZenRegistryBase）——免费层路径改过一次，不该再靠人工观测。
 //
 // 增删一律以本次 live 结果为准：表中的种子条目若不再通过价格门会被移除
 // （种子只在首次成功同步之前的冷启动/离线状态提供兜底，不参与日常增删）。
 // 返回新增模型数。
 func syncZenModels() (int, error) {
 	initZenModels()
-	overlay, freeGate, registryOK := fetchZenRegistry()
+	overlay, freeGate, registryAPI, registryOK := fetchZenRegistry()
 	desired, derr := zenDesiredFromLive(registryOK, freeGate)
 	if derr != nil {
 		return 0, derr
 	}
+	// 基地址先校正：后面 applyZenCatalog 之后马上可能有请求进来。
+	applyZenRegistryBase(registryAPI, getZenConfig().BaseURL)
 	added := applyZenCatalog(desired, overlay)
 	pruned := pruneZenModelsTo(desired)
 	// 重新敷用已学习的端点覆盖：新出现的模型（以及被 prune 后重建的条目）不在

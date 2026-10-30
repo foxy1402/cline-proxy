@@ -141,7 +141,9 @@ Requests also must carry a system message whose `<env>` block contains a `Workin
 
 The zen route table is seeded deterministically from the model catalog's SDK package name (`provider.npm`: `@ai-sdk/openai` → native `/v1/responses`, `@ai-sdk/openai-compatible` → `/chat/completions`) and refined per model by the endpoint learner, whose decisions persist in `.zen-endpoints.json` and are never overwritten by later catalog syncs.
 
-The upstream base URL is `https://opencode.ai/inference/v1` (the URL the current catalog gives the real CLI). The old `https://opencode.ai/zen/v1` still works for keyed traffic but rejects anonymous free-tier requests via a console shim that strips the validated headers, so a saved config pointing exactly at the legacy URL is migrated to the new one on load (custom URLs are left alone); the migration is logged as `zen baseURL migrated: …`.
+The upstream base URL is `https://opencode.ai/inference/openai/v1`. It is not guessed: every catalog sync reads the opencode provider's `api` field from `models.opencode.ai` (the same data the real CLI reads) and corrects the saved config to match — but only when that config still holds the project default. A URL you typed into the admin panel is treated as deliberate and never rewritten. The sync refuses any value that is not `https://opencode.ai/inference/…`, so a tampered catalog response cannot redirect a request carrying your `Authorization` header.
+
+On load, a saved config pointing at one of the two historical defaults is migrated and logged as `zen baseURL migrated: …`: `https://opencode.ai/zen/v1` (the pre-2026-10 console shim, which strips the validated headers and 403s anonymous free-tier traffic) and `https://opencode.ai/inference/v1` (a stale default that omitted the `/openai` segment — corrected 2026-10-30 after capturing the CLI's real traffic).
 
 | Variable | Default | Description |
 |---|---|---|

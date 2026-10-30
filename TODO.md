@@ -56,14 +56,57 @@ accepting it. All three root causes confirmed:
    real long description → 403; no tools at all → 403. Fix: embed the opencode
    CLI 1.19.0 tool definitions (`zen_gate_tools.{go,json}`), keeping the
    chat-form (with `$schema`, min/max) and responses-form (stripped) variants.
-3. **Anonymous traffic must use `/inference/v1`.** For keyed traffic both bases
-   work, but `key = "public"` on the legacy `/zen/v1` shim 403s (the shim strips
-   `authorization` and rewrites `x-opencode-request`). Probe: anon `/zen/v1` →
-   403, anon `/inference/v1` → 200. Fix: default base + migrate a saved config
-   that equals exactly the legacy URL.
+3. **Anonymous traffic must use an `/inference/…` base.** For keyed traffic both
+   bases work, but `key = "public"` on the legacy `/zen/v1` shim 403s (the shim
+   strips `authorization` and rewrites `x-opencode-request`). Probe: anon
+   `/zen/v1` → 403, anon `/inference/…` → 200. Fix: default base + migrate a
+   saved config that equals exactly the legacy URL.
 
 Proven irrelevant (left alone, contrary to first instincts): the stale UA string,
 `tool_choice`, TLS fingerprint, header order, message contents.
+
+### 2026-10-30 — MITM wire diff against the real CLI, and the base path
+
+Captured `opencode` CLI 2.1.4 and the gateway side by side through mitmproxy
+(same host, same IP, same account). The one unambiguous defect:
+
+- **The base path was stale by one segment.** `zenAPIBase` was
+  `https://opencode.ai/inference/v1`, hardcoded from a 2026-10-15 observation;
+  the catalog now gives `https://opencode.ai/inference/openai/v1` for the
+  opencode provider *and* for all 8 free models, and the CLI posts there. Fixed
+  in three layers: the constant, a load-time migration for saved configs that
+  still hold the old default, and — so this cannot rot again —
+  `applyZenRegistryBase`, which re-reads the catalog's `provider.api` on every
+  sync and corrects the config *only* when it still equals a project default.
+  Registry values are accepted only from `https://opencode.ai/inference/…`;
+  a custom base URL typed into the admin panel is never touched.
+
+Request-shape gaps also closed, each because the field was demonstrably absent
+where the CLI sends it:
+
+- `stream_options: {include_usage:true}` on streaming chat requests. Upstream
+  only emits the trailing usage frame when asked, so the gateway's streaming
+  token counts were always zero before this. The frame is swallowed on the way
+  out unless the client asked for it too, so the downstream contract is
+  unchanged.
+- `max_completion_tokens`, defaulted from the model catalog's `limit.output` —
+  which is exactly the `32000` the CLI sends for big-pickle. A client-supplied
+  value (or legacy `max_tokens`) still wins.
+- `strict: false` on the chat-path gate tool stubs. The responses path always
+  had it; the two paths were emitting different shapes of the same tool set.
+
+Deliberately **not** aligned, with reasons: `x-opencode-project` is a random
+hex the CLI persists in its own database — not derivable from any path, remote,
+or commit (brute-forced 10 prefixes × 8 inputs), so `global` remains the only
+honest value. The CLI's 8305-char system prompt vs the gateway's 38-char env
+block, and its absence of `tool_choice`, are anti-detection mimicry rather than
+correctness; the flat-vs-nested tool shape and the env gate are the only parts
+that are actually validated upstream.
+
+Not verified against a live 200: the sacrifice key was already quota-exhausted
+(`Retry-After` ≈ 22h, counting to 00:00 UTC), so all three gateway attempts
+returned 429. The path fix is verified against the catalog and the CLI capture,
+not against an accepted request.
 
 Also fixed from the same audit: `refreshZenSession` no longer skips `key ==
 "public"` — that exemption made the keyless-pool 403 retry byte-identical and

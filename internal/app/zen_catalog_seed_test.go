@@ -29,7 +29,7 @@ func TestFetchZenRegistryNPMPrecedence(t *testing.T) {
 	zenRegistryURL = srv.URL
 	defer func() { zenRegistryURL = old }()
 
-	overlay, freeGate, ok := fetchZenRegistry()
+	overlay, freeGate, _, ok := fetchZenRegistry()
 	if !ok {
 		t.Fatal("registry unreachable")
 	}
@@ -67,7 +67,7 @@ func TestFetchZenRegistryFreeGate(t *testing.T) {
 	zenRegistryURL = srv.URL
 	defer func() { zenRegistryURL = old }()
 
-	_, freeGate, ok := fetchZenRegistry()
+	_, freeGate, _, ok := fetchZenRegistry()
 	if !ok {
 		t.Fatal("registry unreachable")
 	}
@@ -219,7 +219,7 @@ func TestFetchZenRegistryMissingCostFailsClosed(t *testing.T) {
 	zenRegistryURL = srv.URL
 	defer func() { zenRegistryURL = old }()
 
-	_, freeGate, ok := fetchZenRegistry()
+	_, freeGate, _, ok := fetchZenRegistry()
 	if !ok {
 		t.Fatal("registry unreachable")
 	}
@@ -243,7 +243,7 @@ func TestFetchZenRegistryBodyCap(t *testing.T) {
 	zenRegistryURL = srv.URL
 	defer func() { zenRegistryURL = old }()
 
-	if _, _, ok := fetchZenRegistry(); ok {
+	if _, _, _, ok := fetchZenRegistry(); ok {
 		t.Fatal("an over-cap registry body must be treated as unreachable")
 	}
 }

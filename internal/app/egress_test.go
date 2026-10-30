@@ -300,7 +300,7 @@ func TestPinProxyPerKeyDefaultsOnForLegacyConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DATA_DIR", dir)
 	path := filepath.Join(dir, ".zen-config.json")
-	if err := os.WriteFile(path, []byte(`{"enabled":true,"key":"public","keys":["public"],"baseURL":"https://opencode.ai/inference/v1"}`), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"enabled":true,"key":"public","keys":["public"],"baseURL":"https://opencode.ai/inference/openai/v1"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	cfg := loadZenConfig()
