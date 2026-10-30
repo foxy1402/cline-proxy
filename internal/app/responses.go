@@ -704,7 +704,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			nresp, _, rerr := callZenResponsesAPI(r.Context(), chat, true)
 			if rerr != nil {
 				log.Printf("  responses zen native api error: %v", rerr)
-				writeJSON(w, http.StatusBadGateway, map[string]any{
+				writeJSON(w, zenClientErrorStatus(rerr), map[string]any{
 					"error": map[string]string{"message": rerr.Error(), "type": "api_error"},
 				})
 				return
@@ -739,7 +739,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		resp, _, err := callZenAPI(r.Context(), chat, true)
 		if err != nil {
 			log.Printf("  responses zen api error: %v", err)
-			writeJSON(w, http.StatusBadGateway, map[string]any{
+			writeJSON(w, zenClientErrorStatus(err), map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "api_error"},
 			})
 			return

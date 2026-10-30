@@ -1,5 +1,45 @@
 # TODO — Public container deployment: stateless /v1 proxy with multi-account rotation
 
+## zen 429 handling: fail fast, pass 429 through, never fail over (2026-10-30)
+
+Battle-tested against a live single-key container. The reported symptom was
+"cline-proxy cannot upstream to opencode at all", but the container log told a
+different story: between 03:45:24 and 03:47:16 roughly thirty serial requests
+returned 200, including the exact shape that had failed earlier
+(`stream=true tools=64 msgs=8`). Upstream reachability was never the problem.
+
+What the log actually showed, and what each thing turned out to be:
+
+- **Eight requests fired in the same second all 429'd, then everything after
+  became 401.** The 429s advanced the failover counter; once it passed the
+  threshold zen was marked degraded and routed to a cline pool with **zero
+  accounts**, producing `401 No accounts in pool`. A throttle therefore looked
+  like a dead gateway — strictly worse than the original 429. Fixed by removing
+  `markZenFail()` from both 429 branches (rate limiting means zen is healthy and
+  throttling) and by making `markZenFail` a no-op when the pool has nothing to
+  fail over to.
+- **One exhausted key cost 101 seconds.** Each request slept 30s per retry while
+  holding a concurrency slot, and every retry hit the same key that had just
+  been cooled for 20 minutes — the outcome was knowable after the first response.
+  Now a 30s sleep happens only when `zenAnyKeyRotatable(cur)` reports a key that
+  is neither the current one nor cooling; otherwise the 429 is returned
+  immediately and the client owns the backoff. Measured: 101s -> 0.01s on a
+  single-key pool, with healthy-key rotation unchanged.
+- **Upstream 429 was answered with 502 Bad Gateway.** A 502 tells the IDE the
+  gateway is broken and it marks the provider dead; a 429 tells it to back off
+  and retry. `zenClientErrorStatus` now passes 429 through and maps everything
+  else to 502 (genuine aggregator failures keep their existing 502s).
+
+Also established while chasing this: cooldown state is in-memory only, so a
+restart clears it — the container was still running a pre-fix image, which is why
+a stale 401 kept appearing during the investigation.
+
+Regression tests: `TestZen429FailsFastWhenNoRotatableKey`,
+`TestZen429StillRotatesToHealthyKey`, `TestZenClientErrorStatusMapsRateLimit`,
+`TestZenAnyKeyRotatable`, `TestRateLimitDoesNotTriggerFailover`,
+`TestNoFailoverWhenClinePoolEmpty`.
+
+
 ## zen now caps one IP per key — egress is pinned per identity (2026-10-21)
 
 Reported: zen now allows one personal IP per api key. With round-robin egress

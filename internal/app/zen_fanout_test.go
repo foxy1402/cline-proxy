@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -247,5 +248,248 @@ func TestPickZenKeyStillReturnsWhenAllCooled(t *testing.T) {
 
 	if got := pickZenKey(); got == "" {
 		t.Fatal("pickZenKey returned empty while every key was cooling; requests would stop entirely")
+	}
+}
+
+// 限流不得推进故障转移。429 说明 zen 服务正常、只是当前窗口超了；把它计入
+// failover 会让一次瞬时节流把整个 zen 路由切到 cline 池（池为空时客户端拿到
+// 401 "No accounts in pool"，比原来的 429 更难懂）。2026-10-30 实测事故。
+func TestRateLimitDoesNotTriggerFailover(t *testing.T) {
+	zenStateMu.Lock()
+	zenFailCount = 0
+	zenFailUntil = time.Time{}
+	zenStateMu.Unlock()
+	t.Cleanup(func() {
+		zenStateMu.Lock()
+		zenFailCount = 0
+		zenFailUntil = time.Time{}
+		zenStateMu.Unlock()
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "73000")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"limit"}}`))
+	}))
+	defer upstream.Close()
+
+	savedCfg := getZenConfig()
+	cp := *savedCfg
+	cp.Enabled = true
+	cp.BaseURL = upstream.URL
+	cp.Keys = []string{"sk-rl1"}
+	cp.Proxies = nil
+	cp.Retries = 0 // 不睡 30s 重试：本用例只验证 failover 状态不被限流推进
+	cp.Failover = true
+	cp.FailoverCount = 1 // 一次失败就足以触发 failover，便于验证
+	setZenConfig(&cp)
+	t.Cleanup(func() { setZenConfig(savedCfg) })
+	setZenModelForTest("rl-model", "")
+	t.Cleanup(func() {
+		zenKeyMu.Lock()
+		zenKeyCool = map[string]time.Time{}
+		zenKeyMu.Unlock()
+	})
+
+	params := map[string]any{
+		"model":    "rl-model",
+		"messages": []any{map[string]any{"role": "user", "content": "x"}},
+	}
+	// 用短 ctx 打断重试睡眠：本用例只关心"429 分支有没有推进 failover"，
+	// 不需要等完 3 次 ×30s 的重试（cfg.Retries<=0 会被内部回落成 3）。
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	_, _, _ = callZenAPI(ctx, params, true)
+
+	zenStateMu.Lock()
+	cnt, until := zenFailCount, zenFailUntil
+	zenStateMu.Unlock()
+	if cnt != 0 || !until.IsZero() {
+		t.Fatalf("a 429 advanced failover state (count=%d until=%v); rate limiting is not degradation",
+			cnt, until)
+	}
+	if zenFailedNow() {
+		t.Fatal("zen must not be marked degraded by a rate limit")
+	}
+}
+
+// cline 池为空时不得标记 zen 降级：转移目标不存在，路由过去只会得到
+// 401 "No accounts in pool"。
+func TestNoFailoverWhenClinePoolEmpty(t *testing.T) {
+	zenStateMu.Lock()
+	zenFailCount = 0
+	zenFailUntil = time.Time{}
+	zenStateMu.Unlock()
+
+	// 确保 cline 池为空
+	savedPool := loadPool()
+	empty := *savedPool
+	empty.Accounts = nil
+	poolMu.Lock()
+	pool = &empty
+	poolMu.Unlock()
+	t.Cleanup(func() {
+		poolMu.Lock()
+		pool = savedPool
+		poolMu.Unlock()
+		zenStateMu.Lock()
+		zenFailCount = 0
+		zenFailUntil = time.Time{}
+		zenStateMu.Unlock()
+	})
+
+	for i := 0; i < 5; i++ {
+		markZenFail()
+	}
+	if zenFailedNow() {
+		t.Fatal("must not mark zen degraded when the cline pool has no accounts to fail over to")
+	}
+}
+
+// 2026-10-30 实测事故回归：单 key 池 + 恒定 429 时，一次客户端请求要挂 101 秒
+// （4 次上游调用 × 30s 睡眠重试）才把 429 交还，IDE 侧表现为"网关卡死"。
+// key 已被冷却 20 分钟，30s 后重试必然再撞同一个 key——这类等待只是挂住连接。
+//
+// 断言：无可轮转 key 时立即失败，耗时远小于一次 30s 睡眠。
+func TestZen429FailsFastWhenNoRotatableKey(t *testing.T) {
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Retry-After", "78410")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached."}}`))
+	}))
+	defer upstream.Close()
+
+	// 单 key 池：撞 429 后没有任何可换的 key。
+	savedCfg := getZenConfig()
+	cfgCopy := *savedCfg
+	cfgCopy.Enabled = true
+	cfgCopy.BaseURL = upstream.URL
+	cfgCopy.Keys = []string{"sk-single-key"}
+	cfgCopy.Proxies = nil
+	cfgCopy.Retries = 3
+	setZenConfig(&cfgCopy)
+	setZenModelForTest("bbb-single-model", "")
+	t.Cleanup(func() {
+		setZenConfig(savedCfg)
+		zenKeyMu.Lock()
+		zenKeyCool = map[string]time.Time{}
+		zenKeyMu.Unlock()
+	})
+
+	start := time.Now()
+	_, _, err := callZenAPI(t.Context(), map[string]any{
+		"model":    "bbb-single-model",
+		"messages": []any{map[string]any{"role": "user", "content": "x"}},
+	}, true)
+	elapsed := time.Since(start)
+
+	var he *zenHTTPError
+	if !errors.As(err, &he) || he.Status != http.StatusTooManyRequests {
+		t.Fatalf("err = %v, want zenHTTPError 429", err)
+	}
+	// 一次上游调用就够：没有可换的 key，也没有必要睡。
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("upstream hit %d times, want 1 (no rotatable key => no pointless retries)", got)
+	}
+	// 宽松上界：只允许一次网络往返的时间，绝不允许一次 30s 睡眠。
+	if elapsed > 10*time.Second {
+		t.Fatalf("429 took %v to surface; must fail fast when no key can be rotated to", elapsed)
+	}
+}
+
+// 有可轮转 key 时，睡眠重试的行为必须保持（只在真能换到健康 key 时才等）：
+// 2 个 key，第一个恒 429、第二个恒 200 —— 请求必须成功，且不得睡 30s。
+func TestZen429StillRotatesToHealthyKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.Header.Get("Authorization"), "bad") {
+			w.Header().Set("Retry-After", "78410")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached."}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	savedCfg := getZenConfig()
+	cfgCopy := *savedCfg
+	cfgCopy.Enabled = true
+	cfgCopy.BaseURL = upstream.URL
+	cfgCopy.Keys = []string{"sk-bad", "sk-good"}
+	cfgCopy.Proxies = nil
+	cfgCopy.Retries = 3
+	setZenConfig(&cfgCopy)
+	setZenModelForTest("ccc-rotate-model", "")
+	t.Cleanup(func() {
+		setZenConfig(savedCfg)
+		zenKeyMu.Lock()
+		zenKeyCool = map[string]time.Time{}
+		zenKeyMu.Unlock()
+		zenKeyMu.Lock()
+		zenKeyUsage = map[string]int64{}
+		zenKeyMu.Unlock()
+	})
+
+	start := time.Now()
+	resp, _, err := callZenAPI(t.Context(), map[string]any{
+		"model":    "ccc-rotate-model",
+		"messages": []any{map[string]any{"role": "user", "content": "x"}},
+	}, true)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("rotation to the healthy key must succeed, got %v", err)
+	}
+	resp.Body.Close()
+	if elapsed > 10*time.Second {
+		t.Fatalf("healthy-key rotation took %v; switching keys must not sleep", elapsed)
+	}
+}
+
+// 上游 429 必须原样透传为客户端 429。回 502 会让 IDE 判定网关不可用，
+// 而 429 会让它按退避策略重试——语义完全不同。
+func TestZenClientErrorStatusMapsRateLimit(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"upstream 429", &zenHTTPError{Status: http.StatusTooManyRequests, RateLimited: true}, http.StatusTooManyRequests},
+		{"upstream 500", &zenHTTPError{Status: http.StatusInternalServerError}, http.StatusBadGateway},
+		{"upstream 403 gate", &zenHTTPError{Status: http.StatusForbidden}, http.StatusBadGateway},
+		{"plain error", errors.New("dial tcp: refused"), http.StatusBadGateway},
+	}
+	for _, c := range cases {
+		if got := zenClientErrorStatus(c.err); got != c.want {
+			t.Errorf("%s: status = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// zenAnyKeyRotatable 必须只统计"当前 key 之外、且未冷却"的 key。
+func TestZenAnyKeyRotatable(t *testing.T) {
+	savedCfg := getZenConfig()
+	cfgCopy := *savedCfg
+	cfgCopy.Keys = []string{"k1", "k2"}
+	setZenConfig(&cfgCopy)
+	t.Cleanup(func() {
+		setZenConfig(savedCfg)
+		zenKeyMu.Lock()
+		zenKeyCool = map[string]time.Time{}
+		zenKeyMu.Unlock()
+	})
+
+	if !zenAnyKeyRotatable("k1") {
+		t.Fatal("k2 is idle and uncooled: rotation must be reported available")
+	}
+	cooldownZenKey("k2", time.Minute)
+	if zenAnyKeyRotatable("k1") {
+		t.Fatal("k2 is cooling: no key left to rotate to")
+	}
+	if !zenAnyKeyRotatable("k2") {
+		t.Fatal("k1 is idle: rotation from k2 must be reported available")
 	}
 }

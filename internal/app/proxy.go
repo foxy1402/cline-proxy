@@ -614,10 +614,11 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	if err != nil {
 		log.Printf("  zen api error: %v", err)
 		tracker.rec.RateLimited = rateLimited
-		writeJSON(w, http.StatusBadGateway, map[string]any{
+		status := zenClientErrorStatus(err)
+		writeJSON(w, status, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
 		})
-		tracker.finish(false, http.StatusBadGateway)
+		tracker.finish(false, status)
 		return
 	}
 	tracker.rec.RateLimited = rateLimited
@@ -654,10 +655,11 @@ func handleZenChatDirect(w http.ResponseWriter, r *http.Request, params map[stri
 	if err != nil {
 		log.Printf("  zen api error: %v", err)
 		tracker.rec.RateLimited = rateLimited
-		writeJSON(w, http.StatusBadGateway, map[string]any{
+		status := zenClientErrorStatus(err)
+		writeJSON(w, status, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
 		})
-		tracker.finish(false, http.StatusBadGateway)
+		tracker.finish(false, status)
 		return
 	}
 	tracker.rec.RateLimited = rateLimited
@@ -712,10 +714,11 @@ func handleZenResponsesNative(w http.ResponseWriter, r *http.Request, params map
 		}
 		log.Printf("  zen responses api error: %v", err)
 		tracker.rec.RateLimited = rateLimited
-		writeJSON(w, http.StatusBadGateway, map[string]any{
+		status := zenClientErrorStatus(err)
+		writeJSON(w, status, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
 		})
-		tracker.finish(false, http.StatusBadGateway)
+		tracker.finish(false, status)
 		return false
 	}
 	tracker.rec.RateLimited = rateLimited
@@ -2644,10 +2647,11 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 		if rerr != nil {
 			log.Printf("  anthropic zen responses api error: %v", rerr)
 			tracker.rec.RateLimited = rateLimited
-			writeJSON(w, http.StatusBadGateway, map[string]any{
+			status := zenClientErrorStatus(rerr)
+			writeJSON(w, status, map[string]any{
 				"error": map[string]string{"message": rerr.Error(), "type": "api_error"},
 			})
-			tracker.finish(false, http.StatusBadGateway)
+			tracker.finish(false, status)
 			return
 		}
 		defer resp.Body.Close()
@@ -2686,10 +2690,11 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 		if rerr != nil {
 			log.Printf("  anthropic zen responses api error: %v", rerr)
 			tracker.rec.RateLimited = rateLimited2
-			writeJSON(w, http.StatusBadGateway, map[string]any{
+			status := zenClientErrorStatus(rerr)
+			writeJSON(w, status, map[string]any{
 				"error": map[string]string{"message": rerr.Error(), "type": "api_error"},
 			})
-			tracker.finish(false, http.StatusBadGateway)
+			tracker.finish(false, status)
 			return
 		}
 		defer resp2.Body.Close()
@@ -2716,10 +2721,11 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	if err != nil {
 		log.Printf("  anthropic zen api error: %v", err)
 		tracker.rec.RateLimited = rateLimited
-		writeJSON(w, http.StatusBadGateway, map[string]any{
+		status := zenClientErrorStatus(err)
+		writeJSON(w, status, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
 		})
-		tracker.finish(false, http.StatusBadGateway)
+		tracker.finish(false, status)
 		return
 	}
 	tracker.rec.RateLimited = rateLimited

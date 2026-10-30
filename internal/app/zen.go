@@ -6,6 +6,7 @@ import (
 	"cline-go-proxy/internal/kit"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -374,6 +375,14 @@ func markZenSuccess() {
 }
 
 func markZenFail() {
+	// 故障转移只在"有地方可去"时才有意义。cline 池为空时把 zen 判为 degraded
+	// 会把请求路由到一个没有账号的池，客户端拿到 401 "No accounts in pool" ——
+	// 比原来的 429 更糟且更难懂（2026-10-30 实测：8 并发打满 3 次失败阈值后，
+	// 后续所有请求都变成 401，看起来像"zen 彻底坏了"）。
+	// 池为空时直接不记失败：zen 自己的 429/冷却逻辑仍在工作，没有可转移的目标。
+	if total, active := poolStatusSnapshot(); total == 0 || active == 0 {
+		return
+	}
 	cfg := getZenConfig()
 	thr := cfg.FailoverCount
 	if thr <= 0 {
@@ -404,6 +413,21 @@ func zenFailedNow() bool {
 		return false
 	}
 	return true
+}
+
+// zenClientErrorStatus 把 zen 上游的错误映射成回给客户端的 HTTP 状态码。
+//
+// 默认 502：网关确实没能从上游拿到 2xx，语义是"坏网关"。
+// 限流例外：上游 429 是"我这个 key 用完了，你等会再来"，原因在客户端可以
+// 应对的一侧（退避重试、换模型）。回 502 会让 IDE 认为网关坏了——实测
+// OpenCode/Claude 系客户端对 502 的处置是标记服务不可用，而对 429 会按
+// Retry-After 退避重试。故 429 原样透传状态码。
+func zenClientErrorStatus(err error) int {
+	var he *zenHTTPError
+	if errors.As(err, &he) && he.Status == http.StatusTooManyRequests {
+		return http.StatusTooManyRequests
+	}
+	return http.StatusBadGateway
 }
 
 // isRateLimited 限流信号识别: 429/503 直接命中; 502/403 按错误体关键词。
@@ -809,6 +833,19 @@ func uncoolZenKey(key string) {
 	zenKeyMu.Lock()
 	delete(zenKeyCool, key)
 	zenKeyMu.Unlock()
+}
+
+// zenAnyKeyRotatable 是否还有"当前 key 之外、且未在冷却"的 key 可以马上换过去。
+// 决定 429 之后该不该睡眠重试：没有可换的 key 时，睡 30s 再打同一个已冷却的
+// key 只是在挂住客户端的连接（实测单 key 池一次请求挂 101s 才返回 429）。
+// 与 pickZenKey 不同：这里不推进 round-robin 游标，只是只读探测。
+func zenAnyKeyRotatable(cur string) bool {
+	for _, k := range getZenConfig().Keys {
+		if k != "" && k != cur && !zenKeyCooling(k) {
+			return true
+		}
+	}
+	return false
 }
 
 // zenCallOpts 单次上游调用的可选参数（变参：既有 callZenAPI/callZenResponsesAPI
@@ -2176,7 +2213,9 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 				log.Printf("  zen responses rate limited (%d): key-switch budget exhausted (%d/%d) with %d key(s) configured, not cooling the rest",
 					resp.StatusCode, keySwitches, maxKeySwitches, len(cfg.Keys))
 			}
-			if attempt < retries {
+			// 无 key 可换时快速失败，语义与 chat 路径一致（见那里的长注释）：
+			// 睡 30s 后必然重撞同一个已冷却的 key，只是把客户端连接挂住。
+			if attempt < retries && zenAnyKeyRotatable(key) {
 				wait := delay
 				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > wait {
 					wait = retryAfter
@@ -2191,7 +2230,14 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 				delay = zenRetryDelay(delay)
 				continue
 			}
-			markZenFail()
+			if attempt < retries {
+				log.Printf("  zen responses rate limited (%d): no rotatable key, failing fast instead of sleeping %d more time(s)",
+					resp.StatusCode, retries-attempt)
+			}
+			// 限流不是"zen 挂了"：上游明确回了 HTTP 429，服务正常，只是这个
+			// key/身份当前超了窗口。把它计入故障转移会让一次瞬时节流把整个 zen
+			// 路由切走（cline 池为空时客户端直接吃 401），而限流本来已由 key
+			// 冷却 + 换 key + 重试处理。故此处不推进 failover。
 			return nil, rateLimited, apiErr
 		}
 
@@ -2439,7 +2485,14 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 				log.Printf("  zen rate limited (%d): key-switch budget exhausted (%d/%d) with %d key(s) configured, not cooling the rest",
 					resp.StatusCode, keySwitches, maxKeySwitches, len(cfg.Keys))
 			}
-			if attempt < retries {
+			// 睡眠重试只在"等一等就可能变好"时有价值。这个 key 刚被冷却
+			// zenRateLimitCooldown（20 分钟），而这里的等待上限只有 30s ——
+			// 睡醒后重试必然还是撞同一个已冷却的 key。实测单 key 池下，
+			// 一次请求要挂 101 秒（4 次 upstream × 30s 睡眠）才把 429 交还，
+			// IDE 侧看起来像"网关卡死"，而真实结论在第一秒就已确定。
+			// 故：还有别的 key 可轮转 → 上面的换 key 分支已 continue；
+			// 没有 → 立即返回 429，把退避权交还给客户端。
+			if attempt < retries && zenAnyKeyRotatable(key) {
 				// Retry-After 封顶 30s：更长的等待没有意义（槽位被占、客户端早已离开）
 				wait := delay
 				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > wait {
@@ -2455,7 +2508,14 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 				delay = zenRetryDelay(delay)
 				continue
 			}
-			markZenFail()
+			if attempt < retries {
+				log.Printf("  zen rate limited (%d): no rotatable key, failing fast instead of sleeping %d more time(s)",
+					resp.StatusCode, retries-attempt)
+			}
+			// 限流不是"zen 挂了"：上游明确回了 HTTP 429，服务正常，只是这个
+			// key/身份当前超了窗口。把它计入故障转移会让一次瞬时节流把整个 zen
+			// 路由切走（cline 池为空时客户端直接吃 401），而限流本来已由 key
+			// 冷却 + 换 key + 重试处理。故此处不推进 failover。
 			return nil, rateLimited, apiErr
 		}
 
