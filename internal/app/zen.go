@@ -87,13 +87,21 @@ const zenStaleBase = "https://opencode.ai/inference/v1"
 const zenLegacyBase = "https://opencode.ai/zen/v1"
 
 // max429KeySwitches 一次客户端请求因 429 最多切换几个 key 的硬上限。
-//
 // 换 key 是本次调用里唯一不可逆的操作：cooldownZenKey 会把该 key 冻结到
-// Retry-After（可长达 24h，见 maxCooldown）。若不设上限，一个大请求 429 后
-// 沿池顺序把每个 key 逐个冷却，整池在几秒内报废——2026-10-30 实测：单个
-// 291 条消息的请求 4 秒内冷却了 5 个 key。上限取 4（实际生效值再与
-// retries 取小），保证一次坏请求最多牺牲少数几个 key，而不是整个池。
+// zenRateLimitCooldown。若不设上限，一个大请求 429 后沿池顺序把每个 key 逐个
+// 冷却，整池在几秒内报废——2026-10-30 实测：单个 291 条消息的请求 4 秒内冷却
+// 了 5 个 key。上限取 4（实际生效值再与 retries 取小），保证一次坏请求最多
+// 牺牲少数几个 key，而不是整个池。
 const max429KeySwitches = 4
+
+// zenRateLimitCooldown zen key 因 429 冷却的时长上限。
+//
+// 上游的 Retry-After 是"距下一个 00:00 UTC"的倒计时，不是真实恢复时间：实测
+// 最后一个 429 报 RA=20h46m，而 18 分钟后同一 key 就恢复 200 了。按 RA 冷藏会
+// 让多 key 池里的 key 白停一整天。取 20 分钟：足够把流量让给别的 key，又能在
+// 一次瞬时节流过去后很快自愈。（整池都冷却时 pickZenKey 仍会轮转试探，不会
+// 出现无 key 可用。）
+const zenRateLimitCooldown = 20 * time.Minute
 
 // legacyCompactBuffer 压缩 buffer 的历史默认值，仅用于存量配置迁移。
 const legacyCompactBuffer = 20000
@@ -746,8 +754,19 @@ func cooldownZenKey(key string, d time.Duration) time.Duration {
 	if d <= 0 {
 		d = time.Minute
 	}
-	if d > maxCooldown {
-		d = maxCooldown
+	// Retry-After 不可信，必须封顶（2026-10-30 实测）。
+	//
+	// zen 的 Retry-After 恒等于"距下一个 00:00 UTC 的秒数"（实测 75020/74810/
+	// 73790…，全部落在同日 23:59:5x），它是每日窗口的复位倒计时，不是这次限流
+	// 的真实恢复时间。实际观测：最后一个 429（RA=20h46m）之后 **18 分钟**就恢复
+	// 正常 200 了——按 RA 冷藏 key 会让 6 key 池里的 5 个 key 白停一整天，而池子
+	// 其实已经可用。
+	//
+	// 因此 zen key 的冷却以 zenRateLimitCooldown 封顶：够久到把流量让给别的 key，
+	// 又不至于让一次瞬时节流把整池停到午夜。若整个池都在冷却，pickZenKey 仍会
+	// 轮转返回一个 key 继续试探，所以封顶不会造成"无 key 可用"。
+	if d > zenRateLimitCooldown {
+		d = zenRateLimitCooldown
 	}
 	zenKeyMu.Lock()
 	zenKeyCool[key] = time.Now().Add(d)

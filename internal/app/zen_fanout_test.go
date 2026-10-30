@@ -181,3 +181,71 @@ func TestCompactionFiresBelowTypicalClientCap(t *testing.T) {
 		t.Fatalf("small-window floor broken: %d", got)
 	}
 }
+
+// Retry-After 是"距下一个 00:00 UTC"的倒计时，不是真实恢复时间。
+// 2026-10-30 实测：429 报 RA=20h46m，而同一 key 在 18 分钟后即恢复 200。
+// 按 RA 冷藏多 key 池会让 key 白停一整天，故 zen key 冷却必须封顶。
+func TestZenCooldownIsCappedDespiteHugeRetryAfter(t *testing.T) {
+	zenKeyMu.Lock()
+	zenKeyCool = map[string]time.Time{}
+	zenKeyMu.Unlock()
+	t.Cleanup(func() {
+		zenKeyMu.Lock()
+		zenKeyCool = map[string]time.Time{}
+		zenKeyMu.Unlock()
+	})
+
+	const key = "sk-cap-test"
+	// 上游实测值：75020s ≈ 20h50m
+	applied := cooldownZenKey(key, 75020*time.Second)
+
+	if applied > zenRateLimitCooldown {
+		t.Fatalf("applied cooldown %v exceeds cap %v — a 20-minute throttle would park the key for a day",
+			applied, zenRateLimitCooldown)
+	}
+	if applied != zenRateLimitCooldown {
+		t.Fatalf("applied = %v, want the cap %v for an oversized Retry-After", applied, zenRateLimitCooldown)
+	}
+	// 必须真的生效（不能退化成不冷却）
+	if !zenKeyCooling(key) {
+		t.Fatal("key must still be cooled after a 429")
+	}
+	// 短冷却不受影响：15s 的 Retry-After 应原样生效
+	zenKeyMu.Lock()
+	zenKeyCool = map[string]time.Time{}
+	zenKeyMu.Unlock()
+	if got := cooldownZenKey("sk-short", 15*time.Second); got != 15*time.Second {
+		t.Fatalf("short cooldown = %v, want 15s unchanged", got)
+	}
+	// 缺头（0）仍回落到 1 分钟
+	if got := cooldownZenKey("sk-none", 0); got != time.Minute {
+		t.Fatalf("missing Retry-After = %v, want 1m fallback", got)
+	}
+}
+
+// 封顶后整池冷却不应导致"无 key 可用"：pickZenKey 仍须轮转返回一个 key，
+// 否则一次瞬时节流就会让网关完全停止发请求，只能等冷却过期。
+func TestPickZenKeyStillReturnsWhenAllCooled(t *testing.T) {
+	zenKeyMu.Lock()
+	zenKeyCool = map[string]time.Time{}
+	zenKeyMu.Unlock()
+
+	savedCfg := getZenConfig()
+	cp := *savedCfg
+	cp.Keys = []string{"sk-c1", "sk-c2"}
+	cp.Proxies = nil
+	setZenConfig(&cp)
+	t.Cleanup(func() { setZenConfig(savedCfg) })
+	t.Cleanup(func() {
+		zenKeyMu.Lock()
+		zenKeyCool = map[string]time.Time{}
+		zenKeyMu.Unlock()
+	})
+
+	cooldownZenKey("sk-c1", zenRateLimitCooldown)
+	cooldownZenKey("sk-c2", zenRateLimitCooldown)
+
+	if got := pickZenKey(); got == "" {
+		t.Fatal("pickZenKey returned empty while every key was cooling; requests would stop entirely")
+	}
+}
