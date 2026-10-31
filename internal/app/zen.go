@@ -102,7 +102,25 @@ const max429KeySwitches = 4
 // 让多 key 池里的 key 白停一整天。取 20 分钟：足够把流量让给别的 key，又能在
 // 一次瞬时节流过去后很快自愈。（整池都冷却时 pickZenKey 仍会轮转试探，不会
 // 出现无 key 可用。）
+// zenRateLimitCooldown 普通限流（瞬时节流）的 key 冷却上限。
+//
+// 区分两类 429（2026-10-31 新增，见 zenDailyExhausted）：
+//   - 瞬时节流：等一等就恢复。冷却要有上限，否则一次抖动停整池。
+//   - 日额度耗尽（FreeUsageLimitError）：当天不会再好。这种 key 停放到
+//     下一次探针时刻，不再参与每次请求的轮转。
 const zenRateLimitCooldown = 20 * time.Minute
+
+// zenParkInitial 日额度耗尽后的首次停放时长。
+//
+// 为什么不直接停到 00:00 UTC：Retry-After 对"恢复时刻"撒过谎——2026-10-30
+// 实测 RA=20h46m（正好指向 00:00 UTC）的那个 key，18 分钟后就正常 200 了。
+// 停到午夜会让一次误判白停一整天。改为"停放 + 单个探针"：停放期内完全
+// 不参与轮转（IDE 重试风暴不再逐请求打上游），到期只放一个探针出去。
+const zenParkInitial = 30 * time.Minute
+
+// zenParkMaxBackoff 停放间隔的指数退避上限。若额度真的整天不恢复，间隔从
+// 30m 翻倍到 6h，一天只花 4~5 个探针，而不是每分钟一个。
+const zenParkMaxBackoff = 6 * time.Hour
 
 // legacyCompactBuffer 压缩 buffer 的历史默认值，仅用于存量配置迁移。
 const legacyCompactBuffer = 20000
@@ -679,7 +697,198 @@ var (
 	zenKeyIdx   int
 	zenKeyUsage = map[string]int64{} // 每 key 成功调用计数（内存态）
 	zenKeyCool  = map[string]time.Time{}
+	// zenKeyPark 日额度耗尽（FreeUsageLimitError）的 key 停放状态。
+	// 与 zenKeyCool 分开：cool 是"等一会再说"（瞬时节流），park 是
+	// "今天没了，别再逐请求打上游"——两者在面板/日志里语义不同，
+	// 混用一个 map 会让排查时分不清"抖动"和"额度用完"。
+	zenKeyPark = map[string]zenParkState{}
 )
+
+// zenParkState 一个被停放的 key：到 NextProbe 之前完全不参与轮转；
+// 到期后放行**一次**探针，若仍 429 则间隔翻倍（MaxBackoff 封顶）。
+type zenParkState struct {
+	Until     time.Time // 停放截止；此前 pickZenKey 直接跳过
+	NextProbe time.Time // 下一个探针时刻（== Until，保留可读性）
+	Backoff   time.Duration
+	Probes    int  // 已发出的探针次数（面板展示"试过几次了"）
+	Day       string // 触发停放的 UTC 日期（跨日自动失效）
+	Reason    string // 上游错误摘要（面板展示）
+}
+
+// zenDailyExhausted 判断一次限流回包是否是"当天免费额度已耗尽"，
+// 而不是可等待恢复的瞬时节流。
+//
+// 判据来自实测（2026-10-30/31）：
+//   - 错误体 type 是 FreeUsageLimitError，消息形如
+//     "Free usage limit reached. Free models work in OpenCode ... subscribe to
+//     OpenCode Go to keep going"，这是日额度耗尽的固定文案；
+//   - FreeTierError（403）是门禁/策略拒绝，完全不同的类别，不能被当成额度耗尽；
+//   - Retry-After 恰好指向 00:00 UTC（误差容忍几分钟）。
+//
+// 三者都满足才判定"日额度耗尽"。只靠 Retry-After 指向午夜是不够的：
+// 一个瞬时节流恰好发生在 23:50 时，其 RA 也会指向午夜。
+func zenDailyExhausted(status int, body string, retryAfter time.Duration) bool {
+	if status != http.StatusTooManyRequests {
+		return false
+	}
+	low := strings.ToLower(body)
+	// 必须是"用量额度"类错误；显式排除门禁类
+	if strings.Contains(low, "freetiererror") {
+		return false
+	}
+	if !strings.Contains(low, "freeusagelimiterror") &&
+		!strings.Contains(low, "free usage limit") {
+		return false
+	}
+	// RA 须指向下一个 00:00 UTC（容差 30 分钟：上游按秒倒计时，
+	// 且我们从收到响应到计算的延迟会让值略小）。
+	if retryAfter <= 0 {
+		return false
+	}
+	now := time.Now().UTC()
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
+	delta := midnight.Sub(now.Add(retryAfter))
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= 30*time.Minute
+}
+
+// parkZenKey 把 key 停放起来（日额度耗尽）。返回本次的停放时长，
+// 0 表示没有停放（单 key 的 public 哨兵，语义同 cooldownZenKey）。
+//
+// 指数退避：首次 zenParkInitial（30m），之后每次探针仍耗尽则翻倍，
+// 上限 zenParkMaxBackoff（6h）。这样即便额度整天不恢复，一天也只消耗
+// 不到 6 个探针；而万一上游提前恢复（实测确实会提前），最多 30 分钟
+// 后就能自己发现——不需要人手动解封。
+func parkZenKey(key string, reason string) time.Duration {
+	if key == "" {
+		return 0
+	}
+	if key == "public" && len(getZenConfig().Keys) <= 1 {
+		return 0
+	}
+	zenKeyMu.Lock()
+	defer zenKeyMu.Unlock()
+	st := zenKeyPark[key]
+	day := time.Now().UTC().Format("2006-01-02")
+	if st.Day != day {
+		// 新的一天：退避从头开始（跨日必须重置，否则昨天的 6h 会
+		// 让今天的第一个探针白等半天）
+		st = zenParkState{}
+	}
+	if st.Backoff <= 0 {
+		st.Backoff = zenParkInitial
+	} else {
+		st.Backoff *= 2
+		if st.Backoff > zenParkMaxBackoff {
+			st.Backoff = zenParkMaxBackoff
+		}
+	}
+	st.Probes++
+	st.Day = day
+	st.Reason = kit.Truncate(reason, 200)
+	until := time.Now().Add(st.Backoff)
+	st.Until = until
+	st.NextProbe = until
+	zenKeyPark[key] = st
+	// 冷却表里的同类项清掉：park 已经表达"更久的不可用"，
+	// 留着 20m 的 cool 会让面板同时显示两个截止时刻。
+	delete(zenKeyCool, key)
+	return st.Backoff
+}
+
+// zenKeyParked 查询 key 是否处于停放期（未到探针时刻）。
+func zenKeyParked(key string) (time.Time, bool) {
+	zenKeyMu.Lock()
+	defer zenKeyMu.Unlock()
+	st, ok := zenKeyPark[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	if st.Day != time.Now().UTC().Format("2006-01-02") {
+		delete(zenKeyPark, key) // 跨日自动失效
+		return time.Time{}, false
+	}
+	if time.Now().Before(st.Until) {
+		return st.Until, true
+	}
+	return time.Time{}, false
+}
+
+// zenKeyParkState 快照（面板用），不改变状态。
+func zenKeyParkSnapshot(key string) (zenParkState, bool) {
+	zenKeyMu.Lock()
+	defer zenKeyMu.Unlock()
+	st, ok := zenKeyPark[key]
+	if !ok || st.Day != time.Now().UTC().Format("2006-01-02") {
+		return zenParkState{}, false
+	}
+	return st, true
+}
+
+// zenAllParkedUntil 当池内每个 key 都在停放期时，返回最早的探针时刻。
+// ok=false 表示至少有一个 key 可用（含"有 key 但没停放"的常态）。
+//
+// 与 anyZenKeyParked 的差别：这个函数返回"还要等多久"，供拒绝错误和
+// 日志使用；anyZenKeyParked 只回答布尔问题。
+func zenAllParkedUntil() (time.Time, bool) {
+	keys := getZenConfig().Keys
+	if len(keys) == 0 {
+		return time.Time{}, false
+	}
+	var earliest time.Time
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		// public 哨兵在单 key 池里从不被停放（parkZenKey 直接返回 0），
+		// 因此这里自然跳过它、判定为"有可用 key"。
+		until, parked := zenKeyParked(k)
+		if !parked {
+			return time.Time{}, false
+		}
+		if earliest.IsZero() || until.Before(earliest) {
+			earliest = until
+		}
+	}
+	return earliest, !earliest.IsZero()
+}
+
+// zenParkProbeCount 已发出的探针次数（日志用；未停放时为 0）。
+func zenParkProbeCount(key string) int {
+	st, ok := zenKeyParkSnapshot(key)
+	if !ok {
+		return 0
+	}
+	return st.Probes
+}
+
+// unparkZenKey 解除停放（面板"Test"成功、或配置变更时调用）。
+func unparkZenKey(key string) {
+	if key == "" {
+		return
+	}
+	zenKeyMu.Lock()
+	delete(zenKeyPark, key)
+	zenKeyMu.Unlock()
+}
+
+// anyZenKeyParked 池内是否所有 key 都在停放期（用于给出明确的
+// "今日免费额度已用完，预计 <时间> 恢复"错误，而不是反复 429）。
+func anyZenKeyParked() bool {
+	keys := getZenConfig().Keys
+	if len(keys) == 0 {
+		return false
+	}
+	for _, k := range keys {
+		if _, parked := zenKeyParked(k); !parked {
+			return false
+		}
+	}
+	return true
+}
+
 
 // pickZenKey round-robin 选取一个未冷却的 key；全部冷却时按轮转顺序返回下一个。
 // 返回 "" 表示当前没有配置任何 key，或（绑定策略生效时）没有任何 key 分到了
@@ -717,29 +926,50 @@ func pickZenKey() string {
 			delete(zenKeyCool, k)
 		}
 	}
+	// 清理跨日的停放记录：昨日的额度状态对今天没有意义，留着会让
+	// 今天第一个请求就吃到昨天退避到的 6h。
+	today := now.UTC().Format("2006-01-02")
+	for k, st := range zenKeyPark {
+		if st.Day != today {
+			delete(zenKeyPark, k)
+		}
+	}
 	eligible := func(k string) bool { return bound == nil || bound[k] }
-	// 第一轮：非冷却 + 有 live 会话。本地铸造后所有 key 生而有合法会话，
+	// parked 停放期内的 key（日额度耗尽）完全不参与轮转。
+	// 这是与"冷却"的关键区别：冷却期满会主动再试，停放期满同样放行，
+	// 但停放期内的请求**一次都不发**——IDE 的重试风暴不该逐个撞上游。
+	parked := func(k string) bool {
+		st, ok := zenKeyPark[k]
+		if !ok || st.Day != today {
+			return false
+		}
+		// 到期（Until 已过）即视为可放行一次探针
+		return now.Before(st.Until)
+	}
+	// 第一轮：非冷却 + 非停放 + 有 live 会话。本地铸造后所有 key 生而有合法会话，
 	// 此轮几乎总是命中；仅在文件加载失败等异常时退化到第二轮。
 	for i := 0; i < len(keys); i++ {
 		idx := (zenKeyIdx + i) % len(keys)
 		k := keys[idx]
-		if _, cooling := zenKeyCool[k]; !cooling && live[k] && eligible(k) {
+		if _, cooling := zenKeyCool[k]; !cooling && !parked(k) && live[k] && eligible(k) {
 			zenKeyIdx = (idx + 1) % len(keys)
 			return k
 		}
 	}
-	// 第二轮：非冷却（与 live 无关——异常窗口内仍须发请求，
+	// 第二轮：非冷却 + 非停放（与 live 无关——异常窗口内仍须发请求，
 	// 上游 403 是唯一可用信号，恢复路径随后本地换新会话）
 	for i := 0; i < len(keys); i++ {
 		idx := (zenKeyIdx + i) % len(keys)
 		k := keys[idx]
-		if _, cooling := zenKeyCool[k]; !cooling && eligible(k) {
+		if _, cooling := zenKeyCool[k]; !cooling && !parked(k) && eligible(k) {
 			zenKeyIdx = (idx + 1) % len(keys)
 			return k
 		}
 	}
-	// 全部冷却中：仍按轮转返回（保持请求流动，上游会再次限流）。
-	// 绑定过滤仍然生效——没出口的 key 连"冷却重试"都不该发出去。
+	// 第三轮：只剩停放中的 key。停放期未满时仍返回它——但调用方会先
+	// 检查 anyZenKeyParked() 并直接给出"今日额度已用完 + 恢复时间"的明确
+	// 错误，不会真的发出请求。这里返回它只为保持"有 key 可报"的形态，
+	// 让日志能指名是哪个 key 被停放。
 	for i := 0; i < len(keys); i++ {
 		idx := (zenKeyIdx + i) % len(keys)
 		k := keys[idx]
@@ -759,6 +989,10 @@ func markZenKeySuccess(key string) {
 	}
 	zenKeyMu.Lock()
 	zenKeyUsage[key]++
+	// 200 是"该 key 现在确实可用"的最强证据：解除停放并清掉退避。
+	// 停放到期后的第一次探针若成功，走的正是这里——不停用重试路径，
+	// 上游提前恢复时最多 30 分钟就能自动回到轮转。
+	delete(zenKeyPark, key)
 	zenKeyMu.Unlock()
 }
 
@@ -902,6 +1136,16 @@ func zenKeyStatus() []map[string]any {
 			st["cooldownUntil"] = until.Format(time.RFC3339)
 		} else {
 			st["cooling"] = false
+		}
+		// 停放状态（日额度耗尽）与冷却分开表达：两者都让 key 退出轮转，
+		// 但原因和持续时间差一个量级，面板混在一起会让人误判"抖动"。
+		if ps, ok := zenKeyPark[k]; ok && ps.Day == now.UTC().Format("2006-01-02") {
+			st["parked"] = true
+			st["parkedUntil"] = ps.Until.Format(time.RFC3339)
+			st["parkProbes"] = ps.Probes
+			st["parkReason"] = ps.Reason
+		} else {
+			st["parked"] = false
 		}
 		out = append(out, st)
 	}
@@ -2070,6 +2314,20 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 	callIdent := newZenCallIdentity()
 
 	for attempt := 0; ; attempt++ {
+		// 全池停放（日额度耗尽）：与 chat 路径一致，不发上游往返，
+		// 直接给出带恢复时刻的错误。
+		if attempt == 0 && o.pinKey == "" && pinnedZenKey() == "" {
+			if until, ok := zenAllParkedUntil(); ok {
+				log.Printf("  zen responses daily quota exhausted on every key: next probe %v, rejecting without upstream call",
+					until.Format(time.RFC3339))
+				return nil, 1, &zenHTTPError{
+					Status:      http.StatusTooManyRequests,
+					RateLimited: true,
+					Body: fmt.Sprintf("free daily quota exhausted on all %d key(s); next automatic probe at %s UTC",
+						len(cfg.Keys), until.UTC().Format("2006-01-02 15:04 MST")),
+				}
+			}
+		}
 		// 先选 key：attempt==0 或尚无粘性 key 时轮转；重试链内沿用
 		// retryKey（会话绑定要求 key 与 sess_ 一致；换 key 由下方
 		// 限流/403 分支显式改写 retryKey 后 continue 实现）。
@@ -2190,7 +2448,30 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 			// "这个 key 为什么冷却这么久"只能靠猜（实测 FreeUsageLimitError
 			// 的 Retry-After 落在每日窗口复位点，见 TODO.md）。
 			rawRetry := resp.Header.Get("Retry-After")
-			applied := cooldownZenKey(key, parseRetryAfter(rawRetry))
+			raDur := parseRetryAfter(rawRetry)
+			// 日额度耗尽 != 瞬时节流：前者今天不会再好，逐请求重试只是把
+			// IDE 的重试风暴放大成对上游的持续打点（还会让每个失败都记一次
+			// rateLimited，统计失真）。判定后改为"停放该 key"，停放期内
+			// pickZenKey 直接跳过，到期只放一个探针。
+			if zenDailyExhausted(resp.StatusCode, bodyBytes, raDur) {
+				parked := parkZenKey(key, bodyBytes)
+				log.Printf("  zen responses daily quota exhausted (429) key#%d: parked %v (probe #%d), Retry-After=%q",
+					keyIndex(key), parked, zenParkProbeCount(key), rawRetry)
+				// 停放后立即尝试换到别的 key：多 key 池里这一条就把
+				// "一个 key 用完"变成"池子继续可用"。
+				if o.pinKey == "" && keySwitches < maxKeySwitches {
+					if next := pickZenKey(); next != "" && next != key && !zenKeyCooling(next) {
+						log.Printf("  zen responses daily quota exhausted: switching to next zen key (switch %d/%d)",
+							keySwitches+1, maxKeySwitches)
+						key = next
+						retryKey = next
+						keySwitches++
+						continue
+					}
+				}
+				return nil, rateLimited, apiErr
+			}
+			applied := cooldownZenKey(key, raDur)
 			log.Printf("  zen rate limited (%d) key#%d: Retry-After=%q -> cooldown %v",
 				resp.StatusCode, keyIndex(key), rawRetry, applied)
 			// pinKey（面板 Test）：探测结论必须是被探测 key 自己的——立即原样
@@ -2365,6 +2646,22 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 	retryKey := ""
 
 	for attempt := 0; ; attempt++ {
+		// 全池停放（日额度耗尽）：连一个上游往返都不发，直接给出带恢复
+		// 时刻的明确错误。这是停放的真正收益——IDE 的重试风暴不会再
+		// 逐个变成上游请求，用户看到的是"X 点恢复"而不是一串 429。
+		// 面板 Test（pinKey）不受此限：管理员要能主动探一次。
+		if attempt == 0 && o.pinKey == "" && pinnedZenKey() == "" {
+			if until, ok := zenAllParkedUntil(); ok {
+				log.Printf("  zen daily quota exhausted on every key: next probe %v, rejecting without upstream call",
+					until.Format(time.RFC3339))
+				return nil, 1, &zenHTTPError{
+					Status:      http.StatusTooManyRequests,
+					RateLimited: true,
+					Body: fmt.Sprintf("free daily quota exhausted on all %d key(s); next automatic probe at %s UTC",
+						len(cfg.Keys), until.UTC().Format("2006-01-02 15:04 MST")),
+				}
+			}
+		}
 		// 客户端身份：每次 API 调用全新会话（2026-10-27，见 zen_session.go），
 		// 同一调用的重试沿用同一会话，msg_ 请求 ID 每次随机。
 		// ZEN_PIN_KEY=n 时固定用第 n 个 key（单 key 直测/排障），默认轮转。
@@ -2462,7 +2759,30 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 			// 冷却当前 key；若还有其他未冷却 key 则立即切换重试（不睡眠）。
 			// Retry-After 原样入日志（同 responses 路径）。
 			rawRetry := resp.Header.Get("Retry-After")
-			applied := cooldownZenKey(key, parseRetryAfter(rawRetry))
+			raDur := parseRetryAfter(rawRetry)
+			// 日额度耗尽 != 瞬时节流：前者今天不会再好，逐请求重试只是把
+			// IDE 的重试风暴放大成对上游的持续打点（还会让每个失败都记一次
+			// rateLimited，统计失真）。判定后改为"停放该 key"，停放期内
+			// pickZenKey 直接跳过，到期只放一个探针。
+			if zenDailyExhausted(resp.StatusCode, bodyBytes, raDur) {
+				parked := parkZenKey(key, bodyBytes)
+				log.Printf("  zen daily quota exhausted (429) key#%d: parked %v (probe #%d), Retry-After=%q",
+					keyIndex(key), parked, zenParkProbeCount(key), rawRetry)
+				// 停放后立即尝试换到别的 key：多 key 池里这一条就把
+				// "一个 key 用完"变成"池子继续可用"。
+				if o.pinKey == "" && keySwitches < maxKeySwitches {
+					if next := pickZenKey(); next != "" && next != key && !zenKeyCooling(next) {
+						log.Printf("  zen daily quota exhausted: switching to next zen key (switch %d/%d)",
+							keySwitches+1, maxKeySwitches)
+						key = next
+						retryKey = next
+						keySwitches++
+						continue
+					}
+				}
+				return nil, rateLimited, apiErr
+			}
+			applied := cooldownZenKey(key, raDur)
 			log.Printf("  zen rate limited (%d) key#%d: Retry-After=%q -> cooldown %v",
 				resp.StatusCode, keyIndex(key), rawRetry, applied)
 			// pinKey（面板 Test）：立即原样上报 429（冷却已生效），不换 key。

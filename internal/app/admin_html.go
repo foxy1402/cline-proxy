@@ -1397,7 +1397,9 @@ function renderOcKeyStates(ks) {
         } else if (rotateMin === 0) {
           rot = '<span style="color:var(--text2)" title="rotation disabled">never</span>';
         }
-        const cool = k.cooling
+        const cool = k.parked
+          ? '<span style="color:var(--danger)" title="' + esc(k.parkReason || '') + '">quota out · next probe ' + esc(fmtWhen(k.parkedUntil)) + (k.parkProbes ? ' · ' + k.parkProbes + ' probe(s)' : '') + '</span>'
+          : k.cooling
           ? '<span style="color:var(--danger)">cooling' + (k.cooldownUntil ? ' · until ' + esc(fmtWhen(k.cooldownUntil)) : '') + '</span>'
           : '<span style="color:var(--text2)">-</span>';
         // 出口：绑定策略下没分到代理的 key 不会参与轮转（面板要能解释

@@ -1,5 +1,47 @@
 # TODO — Public container deployment: stateless /v1 proxy with multi-account rotation
 
+## zen daily quota exhaustion: park the key, do not retry it (2026-10-31)
+
+Yesterday's fix capped the key cooldown at 20 minutes because `Retry-After`
+lies about *recovery* (20h46m claimed, key worked again in 18 minutes). But
+that cap has a cost: a key whose **daily** free quota is spent gets retried
+every 20 minutes, so an IDE's retry storm turns into a steady drip of doomed
+upstream calls, and every failure is logged as another rate limit.
+
+Now a 429 is classified before deciding what to do with it:
+
+- **Transient throttle** → the existing 20-minute cooldown, unchanged.
+- **Daily exhaustion** → the key is *parked*: removed from rotation entirely
+  until its next probe, with exponential backoff (30m → 1h → 2h → 4h → 6h cap),
+  so a fully spent day costs under 10 upstream calls instead of ~70.
+
+Detection requires all three of: HTTP 429, an error body naming
+`FreeUsageLimitError` / "free usage limit", and a `Retry-After` that lands on
+the next 00:00 UTC (30-minute tolerance). Deliberately **not** parked on:
+`FreeTierError` (that is a policy/gate rejection, a different class), generic
+rate-limit messages, 403, or 503. A transient throttle that happens to occur
+near midnight also carries a midnight `Retry-After`, which is exactly why the
+error-type check is mandatory rather than optional.
+
+Behaviour:
+- `pickZenKey` skips parked keys in both rotation passes.
+- When **every** key is parked, the request is rejected immediately with
+  `429 ... free daily quota exhausted on all N key(s); next automatic probe at
+  <UTC time>` — no upstream round trip at all. `pinKey` (panel Test) bypasses
+  this so an operator can still probe manually.
+- Any 200 clears the park (`markZenKeySuccess`), so early recovery is picked up
+  on the next probe rather than waiting out the backoff.
+- Park state expires across UTC day boundaries; yesterday's 6h backoff cannot
+  delay today's first request.
+- Panel: the key table shows `quota out · next probe <time> · N probe(s)`, and
+  the per-key Test reports status `parked`.
+
+Regression tests in `zen_park_test.go` cover detection (including every
+non-parkable class), backoff monotonicity and cap, probe count per day, rotation
+skipping, cross-day expiry, 200-clears-park, the multi-key rotate-to-healthy
+case, the no-upstream-call bail-out, and the panel snapshot. The bail-out test
+was verified to fail when the fix is disabled, so it is a real guard.
+
 ## zen 429 handling: fail fast, pass 429 through, never fail over (2026-10-30)
 
 Battle-tested against a live single-key container. The reported symptom was

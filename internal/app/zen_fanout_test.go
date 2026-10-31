@@ -83,20 +83,28 @@ func TestZen429KeySwitchIsBounded(t *testing.T) {
 	if distinct < 2 {
 		t.Fatalf("only %d key(s) tried; key switching should still happen within budget", distinct)
 	}
-	// 冷却的 key 数量必须与尝试过的 key 数量一致（每个 429 都冷却自己的 key）。
+	// 每个 429 都要让该 key 退出轮转。两种退出方式都算：
+	// 瞬时节流 → cooldown（20 分钟）；日额度耗尽 → parked（30 分钟起退避）。
+	// 本用例的错误体是真实的 FreeUsageLimitError + 指向午夜的 Retry-After，
+	// 因此走的是 parked 分支——断言必须接受它，否则测的就不是"预算是否
+	// 约束住扇出"，而是"退化成哪一种状态"。
 	cooled := 0
 	zenKeyMu.Lock()
 	for _, k := range keys {
 		if until, ok := zenKeyCool[k]; ok && time.Now().Before(until) {
 			cooled++
+			continue
+		}
+		if ps, ok := zenKeyPark[k]; ok && ps.Day == time.Now().UTC().Format("2006-01-02") {
+			cooled++
 		}
 	}
 	zenKeyMu.Unlock()
 	if cooled > wantMax {
-		t.Fatalf("%d keys cooled, budget allows at most %d", cooled, wantMax)
+		t.Fatalf("%d keys taken out of rotation, budget allows at most %d", cooled, wantMax)
 	}
 	if cooled < distinct {
-		t.Fatalf("tried %d keys but only %d cooled; every 429'd key must be cooled", distinct, cooled)
+		t.Fatalf("tried %d keys but only %d were cooled/parked; every 429'd key must leave rotation", distinct, cooled)
 	}
 }
 
