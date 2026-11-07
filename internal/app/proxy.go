@@ -590,10 +590,14 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	// （trade-off 记录：曾考虑按目录 provider.npm 推断端点，但 29 个免费模型
 	// 中 23 个无 npm 字段、无规律可循——运行时探测是唯一可靠信号。）
 	if zm.Upstream == "responses" {
+		captureZenRequest("responses-native", params, r.Header)
 		_ = handleZenResponsesNative(w, r, params, zm, tracker)
 		return
 	}
 
+	// 抓包点必须在上游调用之前：目的是记录"客户端到底发了什么"，
+	// 即便这次请求随后 429，抓包文件仍然落地，才能与失败日志对上时间。
+	captureZenRequest("chat", params, r.Header)
 	resp, rateLimited, err := callZenAPI(r.Context(), params, true)
 	if err != nil && isWrongEndpoint(err) {
 		// 只在另一个端点真的成功后才持久化"该模型走 responses"。
