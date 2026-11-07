@@ -25,6 +25,14 @@ type zenStatsRecord struct {
 	Status           int    `json:"status"`
 	LatencyMs        int64  `json:"latencyMs"`
 	PromptTokens     int    `json:"promptTokens"`     // 入站估算
+	// UpstreamPromptTokens 上游 usage 回报的**真实**计费输入 token 数。
+	// PromptTokens 只是入站请求体的字节估算，不含网关注入的 gate 工具
+	// schema，因此与真实扣额度差一个量级（实测一个 64 工具的 IDE 请求约
+	// 12.8k，而估算值只有几千）。排查"为什么一次请求就打爆日额度"必须
+	// 看这个字段，否则会误判成内容被扫描。
+	UpstreamPromptTokens int `json:"upstreamPromptTokens,omitempty"`
+	// CachedTokens 其中命中前缀缓存的部分（上游 prompt_tokens_details）。
+	CachedTokens     int    `json:"cachedTokens,omitempty"`
 	CompletionTokens int    `json:"completionTokens"` // 上游 usage 或估算
 	CompactionTokens int    `json:"compactionTokens"` // 摘要生成消耗
 	RateLimited      int    `json:"rateLimited"`      // 本次请求触发限流的次数
@@ -72,9 +80,25 @@ func zenUsageFn(t *zenStatsTracker) func(map[string]any) {
 	if t == nil {
 		return nil
 	}
-	return func(u map[string]any) {
-		if ct, ok := u["completion_tokens"].(float64); ok {
-			t.rec.CompletionTokens = int(ct)
+	return func(u map[string]any) { applyZenUsage(&t.rec, u) }
+}
+
+// applyZenUsage 把上游 usage 里的真实计费数字记进统计。
+//
+// 这是唯一能看到"一次请求实际花了多少额度"的地方：入站估算（PromptTokens）
+// 只算客户端请求体，完全不含网关注入的 gate 工具 schema（12 个工具约
+// 13.5KB ≈ 3.8k token），所以估算与真实计费差一个量级。日额度是按真实
+// 用量扣的，因此排查额度问题时必须看 UpstreamPromptTokens。
+func applyZenUsage(rec *zenStatsRecord, u map[string]any) {
+	if v, ok := u["prompt_tokens"].(float64); ok {
+		rec.UpstreamPromptTokens = int(v)
+	}
+	if v, ok := u["completion_tokens"].(float64); ok {
+		rec.CompletionTokens = int(v)
+	}
+	if d, ok := u["prompt_tokens_details"].(map[string]any); ok {
+		if v, ok := d["cached_tokens"].(float64); ok {
+			rec.CachedTokens = int(v)
 		}
 	}
 }
@@ -87,6 +111,15 @@ func (t *zenStatsTracker) finish(ok bool, status int) {
 	t.rec.OK = ok
 	t.rec.Status = status
 	t.rec.LatencyMs = time.Since(t.started).Milliseconds()
+	// 把真实计费打进日志：日额度是按 token 扣的，没有这一行，"为什么发一句话
+	// 就把额度用完了"只能靠猜（客户端系统提示词？内容被扫描？）——实际上是
+	// 工具 schema 的体积。每次请求一行，代价可忽略。
+	if t.rec.UpstreamPromptTokens > 0 {
+		log.Printf("  zen usage: prompt=%d cached=%d new=%d completion=%d status=%d",
+			t.rec.UpstreamPromptTokens, t.rec.CachedTokens,
+			t.rec.UpstreamPromptTokens-t.rec.CachedTokens,
+			t.rec.CompletionTokens, status)
+	}
 	recordZenStats(t.rec)
 }
 
@@ -137,12 +170,27 @@ func loadStatsFromFile() *zenStatsAgg {
 	return agg
 }
 
+// billedPromptTokens 取"该记多少输入 token"：优先用上游回报的真实计费值，
+// 只有拿不到 usage 时才退回入站估算。
+//
+// 为什么必须优先真实值：日免费额度是按上游计费的输入 token 扣的，而入站
+// 估算只算客户端请求体、不含工具 schema 的体积，两者差两个数量级（实测
+// 一次 ZCode 形态请求真实 10887，估算只有几千）。按估算显示会让面板
+// 严重低估消耗——正是"为什么发一句话就没额度了"的排查陷阱。
+func billedPromptTokens(rec *zenStatsRecord) int {
+	if rec.UpstreamPromptTokens > 0 {
+		return rec.UpstreamPromptTokens
+	}
+	return rec.PromptTokens
+}
+
 func aggregateRecord(agg *zenStatsAgg, rec *zenStatsRecord) {
 	if agg == nil || rec == nil {
 		return
 	}
+	billed := billedPromptTokens(rec)
 	agg.Requests++
-	agg.PromptTok += int64(rec.PromptTokens)
+	agg.PromptTok += int64(billed)
 	agg.CompleteTok += int64(rec.CompletionTokens)
 	agg.Compaction += int64(rec.CompactionTokens)
 	agg.RateLimited += int64(rec.RateLimited)
@@ -152,7 +200,7 @@ func aggregateRecord(agg *zenStatsAgg, rec *zenStatsRecord) {
 		agg.ByModel[rec.Model] = m
 	}
 	m.Requests++
-	m.PromptTok += int64(rec.PromptTokens)
+	m.PromptTok += int64(billed)
 	m.CompleteTok += int64(rec.CompletionTokens)
 }
 

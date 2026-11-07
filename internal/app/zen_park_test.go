@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -235,7 +236,9 @@ func TestDailyExhaustedParksAndStopsRetrying(t *testing.T) {
 	var hits int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
-		w.Header().Set("Retry-After", "80378")
+		// 动态生成"距下一个 00:00 UTC 的秒数"：硬编码具体数字会随真实
+		// 时间推移偏离午夜，测试就会莫名其妙开始失败。
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfterToMidnight().Seconds())))
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(zenFreeUsageBody))
 	}))
@@ -290,7 +293,9 @@ func TestDailyExhaustedRotatesToHealthyKey(t *testing.T) {
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.Header.Get("Authorization"), "bad") {
-			w.Header().Set("Retry-After", "80378")
+			// 动态生成"距下一个 00:00 UTC 的秒数"：硬编码具体数字会随真实
+			// 时间推移偏离午夜，测试就会莫名其妙开始失败。
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfterToMidnight().Seconds())))
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(zenFreeUsageBody))
 			return

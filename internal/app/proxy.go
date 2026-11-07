@@ -626,15 +626,10 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	tracker.rec.Status = resp.StatusCode
 
 	usageFn := func(u map[string]any) {
-		if pt, ok := u["prompt_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens += int(pt) - tracker.rec.PromptTokens
-			if tracker.rec.CompletionTokens < 0 {
-				tracker.rec.CompletionTokens = 0
-			}
-		}
-		if ct, ok := u["completion_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens = int(ct)
-		}
+		// 直接记上游回报的真实计费数字（prompt/completion/cached）。
+		// 此前这里用 prompt_tokens 反推 completion，既算错又丢掉了真实
+		// 输入量——而日额度正是按输入 token 扣的。
+		applyZenUsage(&tracker.rec, u)
 	}
 
 	if isStream {
@@ -666,9 +661,7 @@ func handleZenChatDirect(w http.ResponseWriter, r *http.Request, params map[stri
 	defer resp.Body.Close()
 	tracker.rec.Status = resp.StatusCode
 	usageFn := func(u map[string]any) {
-		if ct, ok := u["completion_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens = int(ct)
-		}
+		applyZenUsage(&tracker.rec, u)
 	}
 	if isStream {
 		handleStreamResponseWithUsage(w, resp, usageFn)
@@ -686,15 +679,10 @@ func handleZenChatDirect(w http.ResponseWriter, r *http.Request, params map[stri
 // 避免把上游瞬时 500 当成端点信号持久化。
 func handleZenResponsesNative(w http.ResponseWriter, r *http.Request, params map[string]any, zm *ZenModel, tracker *zenStatsTracker) bool {
 	usageFn := func(u map[string]any) {
-		if pt, ok := u["prompt_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens += int(pt) - tracker.rec.PromptTokens
-			if tracker.rec.CompletionTokens < 0 {
-				tracker.rec.CompletionTokens = 0
-			}
-		}
-		if ct, ok := u["completion_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens = int(ct)
-		}
+		// 直接记上游回报的真实计费数字（prompt/completion/cached）。
+		// 此前这里用 prompt_tokens 反推 completion，既算错又丢掉了真实
+		// 输入量——而日额度正是按输入 token 扣的。
+		applyZenUsage(&tracker.rec, u)
 	}
 	clientStream, _ := params["stream"].(bool)
 	// spark 等原生 responses 模型只接受 stream=true（官方 CLI 恒发 true；
