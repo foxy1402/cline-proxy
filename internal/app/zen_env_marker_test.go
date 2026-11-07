@@ -10,6 +10,9 @@ import (
 // to accept a zen chat call; without it, the same IP/account/TLS/
 // headers/tools get 429. The value itself is not validated.
 func TestEnsureZenEnvMarkerChat(t *testing.T) {
+	// 本测试只验证 env 闸块逻辑；关掉系统提示词换位（默认开，见
+	// zen_system_relocation_test.go），避免换位改变 system 内容干扰断言。
+	setZenSystemRelocation(t, false)
 	// No system message at all -> a system message with the marker is prepended.
 	body := buildZenBody(map[string]any{
 		"model":    "big-pickle",

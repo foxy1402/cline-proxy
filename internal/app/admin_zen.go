@@ -40,6 +40,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"sessionRotateMinutes": cfg.SessionRotateMinutes,
 		"orgID":                cfg.OrgID,
 		"pinProxyPerKey":       pinProxyPerKeyEnabled(),
+		"systemRelocation":     zenSystemRelocationEnabled(),
 		"egress":               zenEgressSnapshot(),
 		"runtime": map[string]any{
 			"failoverActive": zenFailedNow(),
@@ -81,6 +82,8 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		OrgID *string `json:"orgID"`
 		// 每 key 固定出口代理：指针用于区分"未提交"与显式 false。
 		PinProxyPerKey *bool `json:"pinProxyPerKey"`
+		// 系统提示词换位：指针用于区分"未提交"与显式 false。
+		SystemRelocation *bool `json:"systemRelocation"`
 		Compaction     *struct {
 			Auto         *bool   `json:"auto"`
 			Buffer       *int    `json:"buffer"`
@@ -109,6 +112,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		SessionRotateMinutes: cur.SessionRotateMinutes,
 		OrgID:                cur.OrgID,
 		PinProxyPerKey:       cur.PinProxyPerKey,
+		SystemRelocation:     cur.SystemRelocation,
 	}
 	if patch.Enabled != nil {
 		next.Enabled = *patch.Enabled
@@ -161,6 +165,9 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.PinProxyPerKey != nil {
 		next.PinProxyPerKey = patch.PinProxyPerKey
+	}
+	if patch.SystemRelocation != nil {
+		next.SystemRelocation = patch.SystemRelocation
 	}
 	if patch.OrgID != nil {
 		// 空串即清除（不编造 org id：原始 API key 流量本来就没有）。

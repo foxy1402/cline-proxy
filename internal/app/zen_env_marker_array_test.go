@@ -31,6 +31,9 @@ func TestEnvMarkerDetectsArraySystemContent(t *testing.T) {
 
 // 数组形态且缺 marker：追加一个 text part，而不是新增第二条 system。
 func TestEnvMarkerAppendsToArraySystemContent(t *testing.T) {
+	// 只验证 marker 追加逻辑；关掉默认开启的系统提示词换位
+	// （换位会把数组 system 换成 string 形态的固定提示词）。
+	setZenSystemRelocation(t, false)
 	params := map[string]any{
 		"model": "big-pickle",
 		"messages": []any{
@@ -111,6 +114,9 @@ func TestEnvMarkerDoesNotMutateClientArrayParams(t *testing.T) {
 
 // responses 路径：数组形态 system 内容必须并入 instructions，不能整段丢弃。
 func TestResponsesKeepsArraySystemContent(t *testing.T) {
+	// 只验证"数组 system 文本不被丢弃"；关掉换位（换位会把它移到
+	// 首条 user input，见 zen_system_relocation_test.go 的 responses 用例）。
+	setZenSystemRelocation(t, false)
 	params := map[string]any{
 		"model": "big-pickle",
 		"messages": []any{

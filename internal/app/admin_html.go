@@ -574,6 +574,11 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>Pin one egress proxy per key</label>
         <select id="ocPinProxy"><option value="true">On — one key, one exit IP</option><option value="false">Off — rotate per request</option></select>
       </div>
+      <div class="field"><label>Relocate system prompt to user message</label>
+        <select id="ocSystemRelocate" title="The client's system/developer prompt is moved into the first user message wrapped in &lt;system&gt;…&lt;/system&gt;; the system role carries a short fixed prompt instead.">
+          <option value="true">On — system role keeps a fixed short prompt</option><option value="false">Off — forward the client system prompt as-is</option>
+        </select>
+      </div>
       <div class="field"><label>Egress capacity</label><span id="ocEgressInfo" class="stat-mini" style="align-self:center">-</span></div>
     </div>
     <p class="hint" style="margin-top:0">opencode zen records the egress IP per key and treats a key seen from several IPs as suspicious, so each key is pinned to one proxy by default, and keys that got no proxy are skipped — they would otherwise leak an extra IP. One proxy serves one identity per upstream; Cline accounts get the same treatment when the Cline pool uses proxies. Turn this off only for troubleshooting.</p>
@@ -1316,6 +1321,7 @@ async function loadOcConfig() {
     if (_('ocSessionRotate')) _('ocSessionRotate').value = (c.sessionRotateMinutes != null ? c.sessionRotateMinutes : 120);
     if (_('ocOrgID')) _('ocOrgID').value = c.orgID || '';
     if (_('ocPinProxy')) _('ocPinProxy').value = String(c.pinProxyPerKey !== false);
+    if (_('ocSystemRelocate')) _('ocSystemRelocate').value = String(c.systemRelocation !== false);
     const eg = c.egress || {};
     if (_('ocEgressInfo')) {
       const un = eg.unassigned || 0;
@@ -1360,6 +1366,7 @@ async function saveOcConfig() {
     sessionRotateMinutes: rot,
     orgID: _('ocOrgID') ? _('ocOrgID').value.trim() : '',
     pinProxyPerKey: _('ocPinProxy') ? _('ocPinProxy').value === 'true' : true,
+    systemRelocation: _('ocSystemRelocate') ? _('ocSystemRelocate').value === 'true' : true,
     compaction: {
       auto: _('ocCompactAuto').value === 'true',
       buffer: parseInt(_('ocCompactBuffer').value) || 80000,
