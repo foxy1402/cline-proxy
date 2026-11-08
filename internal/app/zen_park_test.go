@@ -198,7 +198,7 @@ func TestAllParkedBailsOutWithoutUpstreamCall(t *testing.T) {
 	cfg.Keys = []string{"k1"}
 	cfg.Proxies = nil
 	setZenConfig(&cfg)
-	setZenModelForTest("zzz-parked-model", "")
+	withZenModelForTest(t, "zzz-parked-model", "")
 	t.Cleanup(func() { setZenConfig(saved) })
 	zenSessFailedMu.Lock()
 	zenSessFailed = map[string]int{}
@@ -252,7 +252,7 @@ func TestDailyExhaustedParksAndStopsRetrying(t *testing.T) {
 	cfg.Proxies = nil
 	cfg.Retries = 3
 	setZenConfig(&cfg)
-	setZenModelForTest("zzz-quota-model", "")
+	withZenModelForTest(t, "zzz-quota-model", "")
 	t.Cleanup(func() { setZenConfig(saved) })
 	zenSessFailedMu.Lock()
 	zenSessFailed = map[string]int{}
@@ -314,7 +314,7 @@ func TestDailyExhaustedRotatesToHealthyKey(t *testing.T) {
 	cfg.Proxies = nil
 	cfg.Retries = 3
 	setZenConfig(&cfg)
-	setZenModelForTest("zzz-multi-model", "")
+	withZenModelForTest(t, "zzz-multi-model", "")
 	t.Cleanup(func() { setZenConfig(saved) })
 	zenSessFailedMu.Lock()
 	zenSessFailed = map[string]int{}

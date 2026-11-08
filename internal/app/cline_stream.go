@@ -40,6 +40,16 @@ func clineStreamFile() string {
 var (
 	clineStreamMu      sync.RWMutex
 	clineStreamLearned map[string]string // model id -> 学习时间(RFC3339)
+
+	// clineStreamSaveMu 串行化写盘。
+	//
+	// 学习路径为了不在 RWMutex 下做慢 I/O，是"锁内改内存、锁外写盘"。两个
+	// 并发请求同时学到不同模型时，两次 saveClineStream 会同时往**同一个**
+	// .tmp 路径写：一把 O_TRUNC 覆盖另一把正在写的内容，随后先完成的 rename
+	// 发布出去，后一个 rename 报 ENOENT（只记日志）。结果是丢更新（新学的
+	// 模型被旧快照覆盖，下次仍要付一次失败重试）甚至发出半截 JSON。
+	// 与 zen_endpoint.go 的 zenEndpointSaveMu 同一手法。
+	clineStreamSaveMu sync.Mutex
 )
 
 // clineEmptyStreamErr 响应是否呈"该模型必须流式"的指纹：HTTP 500 且 body 含
@@ -86,16 +96,47 @@ func learnClineStreamRequired(modelID string) {
 		return
 	}
 	clineStreamLearned[modelID] = time.Now().Format(time.RFC3339)
-	// 持锁只做内存改动：写盘是慢 I/O，快照出去在锁外做，避免阻塞并发请求的
-	// modelNeedsStream 读路径。
+	clineStreamMu.Unlock()
+
+	log.Printf("cline stream learned: model=%s requires stream=true (persisted)", modelID)
+	// 快照在**写盘锁内**取，不在内存锁内取。
+	//
+	// 这一步是必须的：只给写盘加互斥还不够——如果每个 goroutine 先各自取
+	// 快照、再排队写盘，那排在后面的旧快照会把前面新写的覆盖掉（经典
+	// lost update）。实测 16 并发学习最终只落盘 6 个甚至 2 个模型。
+	// 真正的语义是"落盘当前最新的全量状态"，所以快照必须紧挨着写。
+	// 代价：慢 I/O 期间会持有 clineStreamSaveMu，但那把锁不参与读路径
+	// （modelNeedsStream 只碰 clineStreamMu），不会拖慢请求。
+	saveClineStreamCurrent()
+}
+
+// saveClineStreamCurrent 取当前全量学习结果的最新快照并原子落盘。
+//
+// 锁顺序固定为 clineStreamSaveMu → clineStreamMu（只在这一个方向取），
+// 与任何读路径（只取 clineStreamMu）都不会成环。
+func saveClineStreamCurrent() {
+	clineStreamSaveMu.Lock()
+	defer clineStreamSaveMu.Unlock()
+
+	clineStreamMu.RLock()
 	snapshot := make(map[string]string, len(clineStreamLearned))
 	for k, v := range clineStreamLearned {
 		snapshot[k] = v
 	}
-	clineStreamMu.Unlock()
+	clineStreamMu.RUnlock()
 
-	log.Printf("cline stream learned: model=%s requires stream=true (persisted)", modelID)
-	saveClineStream(snapshot)
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := clineStreamFile() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("cline stream learn save failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, clineStreamFile()); err != nil {
+		log.Printf("cline stream learn save failed (rename): %v", err)
+	}
 }
 
 // loadClineStreamLearned 启动时恢复学习结果。
@@ -115,23 +156,6 @@ func loadClineStreamLearned() {
 	clineStreamMu.Unlock()
 	if n > 0 {
 		log.Printf("cline stream learn loaded: %d model(s) require streaming", n)
-	}
-}
-
-// saveClineStream 原子写盘（入参是不持锁的快照）。写失败只记日志不阻断请求——
-// 学习结果是优化项，丢失只会让下一次非流式请求再付一次重试代价。
-func saveClineStream(learned map[string]string) {
-	data, err := json.MarshalIndent(learned, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := clineStreamFile() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		log.Printf("cline stream learn save failed: %v", err)
-		return
-	}
-	if err := os.Rename(tmp, clineStreamFile()); err != nil {
-		log.Printf("cline stream learn save failed (rename): %v", err)
 	}
 }
 

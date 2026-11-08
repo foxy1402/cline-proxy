@@ -97,7 +97,7 @@ To seed Cline accounts on first boot, drop a `cline-seed.json` file into the vol
 
 > **Public HTTPS:** `docker-compose.yml` ships an optional `caddy` service (profile `tls`) with a ready `Caddyfile` for automatic Let's Encrypt certificates. Set `DOMAIN` in `.env`, then `docker compose --profile tls up -d`. On Portainer/NAS, put the proxy behind your existing reverse proxy instead and forward to port `3457`.
 
-> **Bind-mount note (Portainer/NAS users):** the container runs as a non-root user, so a **named volume** (`-v cline-proxy-data:/app/data`) is preferred. If you bind-mount a host directory (e.g. `-v /opt/cline-proxy-data:/app/data`), pre-create it and chown it to UID 1000 (`chown -R 1000:1000 /opt/cline-proxy-data`) or the gateway cannot write its state files and will fail to persist accounts.
+> **Bind-mount note (Portainer/NAS users):** the container runs as a non-root user, so a **named volume** (`-v cline-proxy-data:/app/data`) is preferred. If you bind-mount a host directory (e.g. `-v /opt/cline-proxy-data:/app/data`), pre-create it and chown it to the image's user (`chown -R 100:101 /opt/cline-proxy-data` — the image runs as `app`, created by `adduser -S` which allocates UID/GID 100/101, **not** 1000) or the gateway cannot write its state files and will fail to persist accounts.
 
 ## Configuration
 

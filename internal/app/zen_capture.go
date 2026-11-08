@@ -99,14 +99,18 @@ func captureZenRequest(label string, params map[string]any, h http.Header) {
 		Path:    label,
 		Headers: map[string]string{},
 	}
-	// 请求头：Authorization 打码，其余原样（UA / session 头对门禁排查有用）。
+	// 请求头：凭据类一律打码，其余原样（UA / session 头对门禁排查有用）。
+	//
+	// 必须覆盖 x-api-key：网关自己就是用 x-api-key 认证 /v1 客户端的
+	//（Authorization: Bearer 是第二选择）。漏掉它，抓包目录里就躺着调用方的
+	// 有效网关密钥——而抓包正是"复现问题时长期开着、事后容易忘记删"的功能。
+	// 判据用"名字里带 key/auth/token/secret"的宽匹配，宁可多打码。
 	for k, v := range h {
 		lk := strings.ToLower(k)
-		if lk == "authorization" {
-			rec.Headers[k] = "<redacted>"
-			continue
-		}
-		if lk == "cookie" || lk == "proxy-authorization" {
+		if lk == "authorization" || lk == "cookie" || lk == "proxy-authorization" ||
+			lk == "x-api-key" || lk == "api-key" || strings.Contains(lk, "auth") ||
+			strings.Contains(lk, "token") || strings.Contains(lk, "secret") ||
+			strings.Contains(lk, "cookie") {
 			rec.Headers[k] = "<redacted>"
 			continue
 		}

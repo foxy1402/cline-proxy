@@ -28,9 +28,19 @@ import (
 //  2. callClineAutoStream 因此能真的学到该模型并改用 stream=true 重试。
 func TestAutoStreamLearnThroughRealCallee(t *testing.T) {
 	t.Setenv("DATA_DIR", t.TempDir())
+	// 必须保存并恢复：本测试会真学到 "poolside/laguna-s-2.1:free" 需要流式，
+	// 而 clineStreamLearned 是包级全局。不恢复的话，后续任何断言"干净状态"的
+	// 测试（TestClineStreamLearnRoundTrip 的第一句）都会因执行顺序不同而红
+	// ——go test -shuffle=on 会稳定复现。
 	clineStreamMu.Lock()
+	savedLearned := clineStreamLearned
 	clineStreamLearned = nil
 	clineStreamMu.Unlock()
+	t.Cleanup(func() {
+		clineStreamMu.Lock()
+		clineStreamLearned = savedLearned
+		clineStreamMu.Unlock()
+	})
 
 	var sawStream atomic.Value
 	var calls int32
@@ -72,13 +82,34 @@ func TestAutoStreamLearnThroughRealCallee(t *testing.T) {
 		poolMu.Unlock()
 	}()
 
+	// 本测试需要一个"命名约定判定无需流式"的模型。种子表随官方 free feed 变化，
+	// 不再固定包含某个 :free 变体，所以这里自己往缓存里放一个 —— 测试不该依赖
+	// 线上 feed 当前长什么样。
+	const probeModel = "poolside/laguna-s-2.1:free" // 含 ":" → 约定判定"无需流式"
+	modelsMu.Lock()
+	if modelsCache == nil {
+		modelsCache = make(map[string]*ModelInfo)
+	}
+	savedEntry, hadEntry := modelsCache[probeModel]
+	modelsCache[probeModel] = &ModelInfo{ID: probeModel, Source: "free", Provider: "poolside", Cost: "free", Status: ModelActive}
+	modelsMu.Unlock()
+	defer func() {
+		modelsMu.Lock()
+		if hadEntry {
+			modelsCache[probeModel] = savedEntry
+		} else {
+			delete(modelsCache, probeModel)
+		}
+		modelsMu.Unlock()
+	}()
+
 	params := map[string]any{
-		"model":    "poolside/laguna-s-2.1:free", // 含 ":" → 命名约定判定"无需流式"
+		"model":    probeModel,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	}
 
 	// 前置条件：约定判定该模型不需要流式，否则测不到学习路径
-	if modelNeedsStream("poolside/laguna-s-2.1:free") {
+	if modelNeedsStream(probeModel) {
 		t.Fatal("precondition failed: model is already force-streamed by the naming convention")
 	}
 
@@ -103,11 +134,11 @@ func TestAutoStreamLearnThroughRealCallee(t *testing.T) {
 	if !strings.Contains(string(body), "\"ok\"") {
 		t.Fatalf("retry body not returned: %s", body)
 	}
-	if !clineStreamRequired("poolside/laguna-s-2.1:free") {
+	if !clineStreamRequired(probeModel) {
 		t.Fatal("model must be learned as stream-required")
 	}
 	// 后续请求直接命中，无需再付一次非流式探测的代价
-	if !modelNeedsStream("poolside/laguna-s-2.1:free") {
+	if !modelNeedsStream(probeModel) {
 		t.Fatal("learned model must be force-streamed on later requests")
 	}
 }

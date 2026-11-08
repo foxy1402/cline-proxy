@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"crypto/rand"
@@ -10,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +45,11 @@ type apiResponse struct {
 
 func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
 	w.Header().Set("Content-Type", "application/json")
+	// 管理 API 的响应里可能带凭据（opencode/config 直接回明文 key、账号列表
+	// 带 email/refresh token 片段）。不标 no-store 就会被浏览器缓存、被中间
+	// 代理落盘。静态页与 accounts/export 原本就标了，这里补齐到所有管理 JSON。
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(resp)
 }
@@ -50,14 +58,52 @@ func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
 // 不回显 Access-Control-Allow-Origin —— 通配符会让任意网页在无密码模式
 // （默认本机部署）下读写 /admin/api/*（含导出 refresh token、删除全部账号）。
 // OPTIONS 预检在认证前短路。
+//
+// 同时做 CSRF 防线。本面板不使用 CSRF token，靠两道判据：
+//   - 状态变更（非 GET/HEAD）必须是 application/json。跨站页面无法在不触发
+//     预检的前提下发出 application/json 请求（它属于非 safelisted 类型），
+//     而本服务对预检只回 204、不回 CORS 头，浏览器会拦下真正的请求。
+//     这一条挡住 `fetch(..., {headers:{'Content-Type':'text/plain'}})` 这类
+//     "简单请求"写法——json.Unmarshal 并不在乎 Content-Type，没有这道检查
+//     就形同虚设。
+//   - Origin 若存在，必须与 Host 同源。SameSite=Strict 只能挡跨站，挡不住
+//     同一 registrable domain 下的兄弟子域。
 func adminCORS(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if ct := r.Header.Get("Content-Type"); ct != "" {
+				if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/json" {
+					writeAPI(w, http.StatusUnsupportedMediaType, apiResponse{
+						Error: "state-changing admin requests must use Content-Type: application/json",
+					})
+					return
+				}
+			}
+			if !adminOriginAllowed(r) {
+				writeAPI(w, http.StatusForbidden, apiResponse{Error: "cross-origin request rejected"})
+				return
+			}
+		}
 		h(w, r)
 	}
+}
+
+// adminOriginAllowed Origin 存在时必须与 Host 同源；不存在则放行（同源
+// 浏览器导航、curl、脚本调用都不发 Origin）。
+func adminOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 func registerAdminRoutes(mux *http.ServeMux) {
@@ -463,6 +509,17 @@ func handleSSOImport(w http.ResponseWriter, r *http.Request) {
 	//
 	// SSO cookie format expected: workos_session=xxx or similar
 	lines := strings.Split(req.SSOCookies, "\n")
+	// 每行都会触发一次**同步**上游 /auth/refresh 调用。不设上限时，一个 32MB
+	// 的请求体（全局 MaxBytesReader 的默认上限）能排进几十万次认证请求：既是
+	// 自我 DoS（handler 长时间占着 goroutine，服务端没有 WriteTimeout），也是
+	// 对 cline 的请求洪泛。batch-import 早已有同样的 500 上限，这里补齐。
+	const maxSSOImportLines = 500
+	if len(lines) > maxSSOImportLines {
+		writeAPI(w, http.StatusBadRequest, apiResponse{
+			Error: fmt.Sprintf("too many entries: %d (max %d per request)", len(lines), maxSSOImportLines),
+		})
+		return
+	}
 	imported := 0
 	errors := []string{}
 
@@ -687,7 +744,7 @@ func handleAdminAccountReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, status := testAccount(acc)
+	result, status := testAccount(r.Context(), acc)
 
 	if status == "active" {
 		// 探测通过：解除冷却并重置今日统计
@@ -750,7 +807,7 @@ func handleAdminAccountTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, status := testAccount(acc)
+	result, status := testAccount(r.Context(), acc)
 	reason, _ := result["reason"].(string)
 	log.Printf("Test account %s: status=%s reason=%s", truncateEmail(acc.Email), status, reason)
 
@@ -765,7 +822,10 @@ func handleAdminAccountTest(w http.ResponseWriter, r *http.Request) {
 // 测试按钮是"升级版重置"：无论账号当前是 active/cooldown/expired，
 // 都会尝试刷新 Token 并发起一次真实探测；成功则清除所有异常状态。
 // 返回的 status: active / cooldown / expired / error
-func testAccount(acc *Account) (map[string]any, string) {
+// ctx 来自客户端请求：kit.HTTPClient 没有 Timeout，而 BaseURL/代理都是可配的。
+// 没有 ctx 时一个"接住 TCP 但永不复"的上游会把 handler goroutine 永久挂住，
+// 浏览器早关掉了也没人知道。
+func testAccount(ctx context.Context, acc *Account) (map[string]any, string) {
 	// 状态快照必须在池锁内取：探测可能持续数秒，期间刷新协程/其他请求会改写
 	// 同一结构体，锁外读是数据竞争。
 	poolMu.Lock()
@@ -809,7 +869,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 	}
 	bodyJSON, _ := json.Marshal(probeBody)
 
-	req, err := http.NewRequest("POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+	req, err := http.NewRequestWithContext(ctx, "POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
 	if err != nil {
 		return map[string]any{
 			"accountId": acc.AccountID,
@@ -838,7 +898,9 @@ func testAccount(acc *Account) (map[string]any, string) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	// 上游响应体必须有上限：BaseURL/代理是管理面板可配的，一个无限流的
+	// 上游能把进程 OOM 掉。判错只需要前几百字节。
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	bodyStr := string(bodyBytes)
 
 	if resp.StatusCode == 429 {
@@ -1177,7 +1239,7 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"strategy":     cfg.Strategy,
 		"headers":      cfg.Headers,
-		"defaultModel": defaultModel,
+		"defaultModel": getDefaultModelValue(),
 	}})
 }
 

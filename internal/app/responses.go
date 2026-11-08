@@ -427,6 +427,38 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				if m, ok := obj["model"].(string); ok && m != "" {
 					model = m
 				}
+				// 帧内错误：上游常先回 200、再把故障藏在 SSE 帧里（provider
+				// 挂掉时就是如此）。这里不判就会一路走到 response.completed
+				// 并带一个空 output —— 客户端读成"模型什么都没说"，而真正的
+				// 原因（overloaded / model not found）被彻底吞掉，模型自愈
+				// 也永远收不到信号。与 collectStreamResponse 同一判据。
+				if e, ok := obj["error"]; ok && e != nil {
+					msg := ""
+					if em, ok := e.(map[string]any); ok {
+						msg, _ = em["message"].(string)
+					}
+					if msg == "" {
+						msg = strings.TrimSpace(fmt.Sprint(e))
+					}
+					if msg != "" && msg != "<nil>" {
+						if model != "" {
+							recordModelFailure(model, http.StatusOK, msg)
+						}
+						s.event("response.failed", map[string]any{
+							"type": "response.failed",
+							"response": map[string]any{
+								"id":         s.respID,
+								"object":     "response",
+								"created_at": time.Now().Unix(),
+								"model":      model,
+								"status":     "failed",
+								"output":     []any{},
+								"error":      map[string]any{"code": "upstream_error", "message": msg},
+							},
+						})
+						return
+					}
+				}
 				if onUsage != nil {
 					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 						upUsage = u

@@ -11,17 +11,17 @@ import (
 
 // 抓包默认必须关闭：它是排障工具，落盘的是完整会话内容，
 // 未显式开启时绝不能写任何文件。
+//
+// 早先这个测试断言的是 t.TempDir()——一个与抓包路径毫无关系的目录，永远为空，
+// 因此无论实现怎么写都会通过（零信息量）。现在断言真实判定：未配置时
+// zenCaptureDir() 必须为空（实现据此直接返回，不落盘）。
 func TestCaptureOffByDefault(t *testing.T) {
 	t.Setenv("ZEN_CAPTURE_DIR", "")
-	dir := t.TempDir()
+	if dir := zenCaptureDir(); dir != "" {
+		t.Fatalf("capture dir must be empty when unset, got %q", dir)
+	}
+	// 空目录时调用不得 panic、不得创建任何东西（现在它连 OpenFile 都不会走到）。
 	captureZenRequest("chat", map[string]any{"model": "m"}, http.Header{})
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("capture wrote %d file(s) while disabled", len(entries))
-	}
 }
 
 // 开启后必须落盘，且完整记录 system prompt、工具数量与上游 body。

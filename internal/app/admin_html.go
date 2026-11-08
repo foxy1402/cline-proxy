@@ -1241,12 +1241,26 @@ async function loadModels() {
       const st = MODEL_STYLE[m.status] || MODEL_STYLE.unknown;
       const cost = COST_LABEL[m.cost] || m.cost || '';
       const synced = m.syncedAt ? new Date(m.syncedAt).toLocaleTimeString('en-US') : '-';
-      return '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;margin:5px 0;background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:10px;transition:.15s">' +
+      // 元数据行：只渲染真实拿到的字段，缺失就不显示（不猜、不占位假值）
+      const meta = [];
+      if (m.contextLength) meta.push('ctx ' + Number(m.contextLength).toLocaleString('en-US'));
+      if (m.maxOutputTokens) meta.push('out ' + Number(m.maxOutputTokens).toLocaleString('en-US'));
+      if (m.inputModalities && m.inputModalities.length) meta.push('in: ' + m.inputModalities.join('+'));
+      if (m.supportsReasoning) meta.push('reasoning' + (m.reasoningEfforts && m.reasoningEfforts.length ? ' (' + m.reasoningEfforts.join('/') + ')' : ''));
+      if (m.supportsTools) meta.push('tools');
+      if (m.supportsStructuredOutput) meta.push('structured');
+      const metaRow = meta.length
+        ? '<div style="font-size:11px;color:var(--text3);margin-top:3px">' + esc(meta.join(' · ')) +
+          (m.metaSource ? ' <span title="metadata joined from /ai/cline/models">↳ ' + esc(m.metaSource) + '</span>' : '') + '</div>'
+        : '';
+      return '<div style="padding:8px 12px;margin:5px 0;background:rgba(148,163,184,.06);border:1px solid var(--border);border-radius:10px;transition:.15s">' +
+        '<div style="display:flex;align-items:center;gap:10px">' +
         '<span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;flex:1">' + esc(m.id) + '</span>' +
         (m.cost === 'free' ? '<span style="font-size:11px;color:var(--accent2)">no charge</span>' : '') +
         (cost ? '<span class="model-tag">' + esc(cost) + '</span>' : '') +
         '<span class="model-tag" style="' + st.css + '">' + st.label + '</span>' +
         '<span style="font-size:11px;color:var(--text3);min-width:60px;text-align:right">' + synced + '</span>' +
+        '</div>' + metaRow +
         '</div>';
     }).join('');
   } catch (e) { _('modelsList').textContent = 'Failed to load'; }

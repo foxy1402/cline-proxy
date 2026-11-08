@@ -215,20 +215,40 @@ func TestFallbackTruncateKeepsContiguousTail(t *testing.T) {
 	if c, _ := getNested(got[len(got)-1].(map[string]any), "content").(string); c != "last question" {
 		t.Fatalf("newest message dropped: %q", c)
 	}
-	// 被保留的非 system 消息之间不得隔着被丢弃的消息（由 idx 连续性保证：
-	// 这里检查"保留的大消息"至多只有前缀连续的一段）
-	seenBig := false
+	// 保留的**非 system** 消息必须是原序列的一个连续后缀：逐条 continue 会在
+	// 会话中间挖洞（留着更古老的记忆却丢掉紧邻的最新上下文）。
+	//
+	// 早先这里只算了 seenBig 就 break，从不断言 —— 等于没有检查。现在直接比对
+	// 原始顺序：把 got 中非 system 的 content 序列，与"原序列去掉 system 后的
+	// 尾部 len(gotNonSystem) 条"逐项对照。
+	var orig []string
+	for _, raw := range msgs {
+		mm, _ := raw.(map[string]any)
+		if mm == nil || strField(mm, "role") == "system" {
+			continue
+		}
+		c, _ := mm["content"].(string)
+		orig = append(orig, c)
+	}
+	var kept []string
 	for _, raw := range got {
 		mm, _ := raw.(map[string]any)
 		if mm == nil || strField(mm, "role") == "system" {
 			continue
 		}
 		c, _ := mm["content"].(string)
-		big := strings.HasPrefix(c, "大")
-		if seenBig && !big {
-			break
+		kept = append(kept, c)
+	}
+	if len(kept) > len(orig) {
+		t.Fatalf("kept %d messages but only %d existed", len(kept), len(orig))
+	}
+	tail := orig[len(orig)-len(kept):]
+	for i := range kept {
+		if kept[i] != tail[i] {
+			t.Fatalf("retained messages are not a contiguous suffix of the original: "+
+				"index %d kept %q, want %q (a hole was punched mid-conversation)",
+				i, kept[i], tail[i])
 		}
-		seenBig = seenBig || big
 	}
 }
 

@@ -51,7 +51,7 @@ func setupZenProbeTest(t *testing.T, handler http.HandlerFunc) {
 	t.Cleanup(func() { setZenConfig(savedCfg) })
 
 	savedModels, savedAliases := zenModels, zenAliases
-	setZenModelForTest("aaa-probe-model", "")
+	withZenModelForTest(t, "aaa-probe-model", "")
 	t.Cleanup(func() {
 		zenModelsMu.Lock()
 		zenModels, zenAliases = savedModels, savedAliases
@@ -298,7 +298,7 @@ func TestZenKeyTestResponsesUpstreamPath(t *testing.T) {
 		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n"))
 	})
 	// 把模型表整体换成 responses 上游模型（setup 的 cleanup 会恢复原表）
-	setZenModelForTest("aaa-probe-model", "responses")
+	withZenModelForTest(t, "aaa-probe-model", "responses")
 
 	result, status := testZenKey("sk-bbb222", 1, "")
 	if status != "active" {
@@ -479,7 +479,7 @@ func TestZenCall403RefreshesSameKeyOnceThenCoolsAndFails(t *testing.T) {
 	cfgCopy.Retries = 3
 	setZenConfig(&cfgCopy)
 	t.Cleanup(func() { setZenConfig(savedCfg) })
-	setZenModelForTest("aaa-probe-model", "")
+	withZenModelForTest(t, "aaa-probe-model", "")
 	t.Cleanup(func() {
 		zenKeyMu.Lock()
 		zenKeyCool = map[string]time.Time{}
@@ -545,7 +545,7 @@ func TestZenResponses403RefreshesSameKeyOnceThenCoolsAndFails(t *testing.T) {
 	cfgCopy.Retries = 3
 	setZenConfig(&cfgCopy)
 	t.Cleanup(func() { setZenConfig(savedCfg) })
-	setZenModelForTest("resp-model", "responses") // 走原生 responses 路径
+	withZenModelForTest(t, "resp-model", "responses") // 走原生 responses 路径
 	t.Cleanup(func() {
 		zenKeyMu.Lock()
 		zenKeyCool = map[string]time.Time{}

@@ -49,7 +49,7 @@ func TestZen429KeySwitchIsBounded(t *testing.T) {
 	cfgCopy.Retries = 3
 	setZenConfig(&cfgCopy)
 	t.Cleanup(func() { setZenConfig(savedCfg) })
-	setZenModelForTest("aaa-429-model", "")
+	withZenModelForTest(t, "aaa-429-model", "")
 	t.Cleanup(func() {
 		zenKeyMu.Lock()
 		zenKeyCool = map[string]time.Time{}
@@ -137,7 +137,7 @@ func TestZenResponses429KeySwitchIsBounded(t *testing.T) {
 	cfgCopy.Retries = 3
 	setZenConfig(&cfgCopy)
 	t.Cleanup(func() { setZenConfig(savedCfg) })
-	setZenModelForTest("resp-429-model", "responses")
+	withZenModelForTest(t, "resp-429-model", "responses")
 	t.Cleanup(func() {
 		zenKeyMu.Lock()
 		zenKeyCool = map[string]time.Time{}
@@ -292,7 +292,7 @@ func TestRateLimitDoesNotTriggerFailover(t *testing.T) {
 	cp.FailoverCount = 1 // 一次失败就足以触发 failover，便于验证
 	setZenConfig(&cp)
 	t.Cleanup(func() { setZenConfig(savedCfg) })
-	setZenModelForTest("rl-model", "")
+	withZenModelForTest(t, "rl-model", "")
 	t.Cleanup(func() {
 		zenKeyMu.Lock()
 		zenKeyCool = map[string]time.Time{}
@@ -378,7 +378,7 @@ func TestZen429FailsFastWhenNoRotatableKey(t *testing.T) {
 	cfgCopy.Proxies = nil
 	cfgCopy.Retries = 3
 	setZenConfig(&cfgCopy)
-	setZenModelForTest("bbb-single-model", "")
+	withZenModelForTest(t, "bbb-single-model", "")
 	t.Cleanup(func() {
 		setZenConfig(savedCfg)
 		zenKeyMu.Lock()
@@ -431,7 +431,7 @@ func TestZen429StillRotatesToHealthyKey(t *testing.T) {
 	cfgCopy.Proxies = nil
 	cfgCopy.Retries = 3
 	setZenConfig(&cfgCopy)
-	setZenModelForTest("ccc-rotate-model", "")
+	withZenModelForTest(t, "ccc-rotate-model", "")
 	t.Cleanup(func() {
 		setZenConfig(savedCfg)
 		zenKeyMu.Lock()

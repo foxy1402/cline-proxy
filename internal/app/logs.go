@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cline-go-proxy/internal/kit"
@@ -41,11 +42,55 @@ var (
 
 var reqLogsFile = kit.ResolveDataPath("requests.jsonl")
 
+// reqLogCh 落盘队列 + 单写协程。
+//
+// 早先是"每个请求起一个 goroutine 去 open/write/close/stat"：并发 N 个请求
+// 就是 N 个 goroutine + N 个 fd，没有上限也没有等待点（进程收到 SIGTERM 时
+// 在途的日志直接丢）。更糟的是大小检查与截断不是原子的——一个 goroutine 正在
+// O_APPEND 写，另一个判定超限后 os.WriteFile(path, nil) 截断，那条刚写的记录
+// 就没了；Windows 上 O_APPEND 的原子性更弱，两行还可能交错成坏 JSON 行。
+//
+// 改成单写协程后：写、stat、截断全在同一个 goroutine 里串行，天然无竞争；
+// 队列满了就丢（日志是可丢的诊断数据，绝不能反压请求路径）。
+const reqLogQueueSize = 1024
+
+var (
+	reqLogCh      = make(chan []byte, reqLogQueueSize)
+	reqLogOnce    sync.Once
+	reqLogDropped int64 // atomic，仅用于"日志被丢弃"告警去重
+)
+
+func startReqLogWriter() {
+	reqLogOnce.Do(func() {
+		go func() {
+			for data := range reqLogCh {
+				f, err := os.OpenFile(reqLogsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+				if err != nil {
+					continue
+				}
+				f.Write(data)
+				f.Close()
+				// 大小上限（LOG_FILE_MAX_MB，默认 10MB）：超出清空落盘文件
+				//（内存仍保留最近 500 条）。与上面的写同协程，不会互相截断。
+				if st, err := os.Stat(reqLogsFile); err == nil && st.Size() > LogFileMaxBytes() {
+					os.WriteFile(reqLogsFile, nil, 0600)
+				}
+			}
+		}()
+	})
+}
+
 // AppendReqLog 记录一条请求日志：内存环形保留 + 异步追加落盘。
 // LOG_REQUESTS=false 时完全关闭（调用方已跳过，这里兜底）。
 func AppendReqLog(l RequestLog) {
 	if !LogRequestsEnabled() {
 		return
+	}
+	// model 来自请求体，长度不受限：一个 {"model":"AAAA..."} 的 32MB 请求体会
+	// 变成一条 32MB 的记录，500 条环形就是十几 GB 常驻。截断到合理长度即可，
+	// 面板展示本来也只显示一行。
+	if len(l.Model) > 200 {
+		l.Model = l.Model[:200] + "…"
 	}
 	reqLogsMu.Lock()
 	reqLogs = append(reqLogs, l)
@@ -53,19 +98,20 @@ func AppendReqLog(l RequestLog) {
 		reqLogs = reqLogs[len(reqLogs)-maxReqLogs:]
 	}
 	reqLogsMu.Unlock()
-	go func() {
-		data, _ := json.Marshal(l)
-		f, err := os.OpenFile(reqLogsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err != nil {
-			return
+
+	data, err := json.Marshal(l)
+	if err != nil {
+		return
+	}
+	startReqLogWriter()
+	select {
+	case reqLogCh <- append(data, '\n'):
+	default:
+		// 队列满：丢弃并每秒最多告警一次，避免日志本身把玩命刷屏。
+		if n := atomic.AddInt64(&reqLogDropped, 1); n == 1 || n%1000 == 0 {
+			log.Printf("request log queue full, dropped %d entr(ies) so far", n)
 		}
-		f.Write(append(data, '\n'))
-		f.Close()
-		// 大小上限（LOG_FILE_MAX_MB，默认 10MB）：超出清空落盘文件（内存仍保留最近 500 条）
-		if st, err := os.Stat(reqLogsFile); err == nil && st.Size() > LogFileMaxBytes() {
-			os.WriteFile(reqLogsFile, nil, 0600)
-		}
-	}()
+	}
 }
 
 // LoadRequestLogs 返回最近的请求日志（内存优先，启动后从落盘文件补载）。

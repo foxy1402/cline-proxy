@@ -40,3 +40,7 @@ cline-seed.json
 combos.json
 .session-secret
 requests.jsonl
+
+# agent/IDE scratch dirs (local plans, not project artifacts)
+.zcode/
+.zcodeignore

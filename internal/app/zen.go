@@ -95,6 +95,14 @@ const zenLegacyBase = "https://opencode.ai/zen/v1"
 // 牺牲少数几个 key，而不是整个池。
 const max429KeySwitches = 4
 
+// maxZenAttempts 单次上游调用的循环硬上限（纯安全网）。
+//
+// 睡眠重试由 sleeps 管、换 key 由 keySwitches 管，两者各自有界，理论上循环
+// 已收敛。但所有出口都是 continue + 分散的计数器判断，任何一个分支漏判都会
+// 变成无限循环。加一个与业务无关的绝对上限，最坏情况只是提前放弃一次调用，
+// 而不是挂死一个请求 goroutine。取值远高于正常路径可能达到的迭代数。
+const maxZenAttempts = 64
+
 // zenRateLimitCooldown zen key 因 429 冷却的时长上限。
 //
 // 上游的 Retry-After 是"距下一个 00:00 UTC"的倒计时，不是真实恢复时间：实测
@@ -164,22 +172,49 @@ func normalizeZenModelID(id string) string {
 // 410 迁移别名是最后兜底：原始 ID 不存在时返回继任模型（真实模型永远优先，
 // 继任者上线不会被弃用别名遮蔽）。
 func resolveZenModel(id string) (*ZenModel, bool) {
+	return resolveZenModelDepth(id, 0)
+}
+
+// zenAliasMaxDepth 别名解析链的最大深度。持久化的别名表是外部文件，可能被
+// 手改成自环（A→A）或互相成环（A→B→A）。没有上限时递归会耗尽 goroutine
+// 栈，那是 fatal error: stack overflow —— recover 接不住，整个进程死。
+const zenAliasMaxDepth = 8
+
+func resolveZenModelDepth(id string, depth int) (*ZenModel, bool) {
 	id = normalizeZenModelID(id)
 	if id == "" {
 		return nil, false
 	}
+	if depth > zenAliasMaxDepth {
+		log.Printf("zen model alias chain too deep at %q, giving up", id)
+		return nil, false
+	}
 	zenModelsMu.RLock()
-	if m, ok := zenAliases[id]; ok {
+	aliasHit, isAlias := zenAliases[id]
+	// 非别名直查；别名则先查 canonical 表再退回别名指针。
+	//
+	// 别名表只在 initZenModels 里绑一次，而 applyZenCatalog / learnZenEndpoint
+	// 都是用**写时复制**把新条目挂到 zenModels[canonicalID] 上。别名指针永远
+	// 停在 seed 时的快照上：上下文窗口、输出上限、尤其是学习器判定的 Upstream
+	// 全都拿不到更新（mimo/ling/pickle/muse-spark* 这些文档里的别名全中招）。
+	// 所以别名命中后再按 canonical ID 取一次最新条目。
+	if isAlias && aliasHit != nil {
+		if fresh, ok := zenModels[aliasHit.ID]; ok && fresh != nil {
+			zenModelsMu.RUnlock()
+			return fresh, true
+		}
+	}
+	if isAlias {
 		zenModelsMu.RUnlock()
-		return m, true
+		return aliasHit, true
 	}
 	if m, ok := zenModels[id]; ok {
 		zenModelsMu.RUnlock()
 		return m, true
 	}
 	zenModelsMu.RUnlock()
-	if repl := zenDeprecatedReplacement(id); repl != "" {
-		return resolveZenModel(repl)
+	if repl := zenDeprecatedReplacement(id); repl != "" && repl != id {
+		return resolveZenModelDepth(repl, depth+1)
 	}
 	return nil, false
 }
@@ -558,6 +593,13 @@ func loadZenConfig() *zenConfigData {
 		log.Printf("zen compaction buffer migrated: %d -> %d (old value never fired below a 128k client cap)",
 			legacyCompactBuffer, defaultCompactBuffer)
 	}
+	// 配置文件是外部可编辑的，也要过同一把校验锁：否则绕过管理面板的校验
+	//（改文件即可）就能把 zen key 发去内网。非法值就地回退到默认，不阻断启动
+	// —— zen 只是可选上游，不该因为它启动失败。
+	if err := validateZenUpstreamBase(cfg.BaseURL); err != nil {
+		log.Printf("zen baseURL rejected from config file (%v), falling back to %s", err, zenAPIBase)
+		cfg.BaseURL = zenAPIBase
+	}
 	return cfg
 }
 
@@ -654,6 +696,50 @@ func proxiesChanged(a, b []string) bool {
 		}
 	}
 	return false
+}
+
+// validateZenUpstreamBase 校验管理面板设置的 zen 上游基地址。
+//
+// BaseURL 是"把 zen key 发到哪里"的开关，所以它既是 SSRF 入口也是凭据外泄
+// 入口。目录同步那条路径只接受 https://opencode.ai/inference/...；管理面板
+// 则必须放行自建中转/抓包代理（这是文档化的用法），不能套用同一把锁。折中：
+// 要求绝对 URL + http/https + 有 host，并显式拒绝回环/链路本地/私网地址 ——
+// 一个"上游中转"没有任何理由指向 127.0.0.1 或 169.254.169.254。
+//
+// ZEN_ALLOW_PRIVATE_BASE=true 可放行私网（本地跑 mock 上游测试用）。
+func validateZenUpstreamBase(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("baseURL 无法解析: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("baseURL 必须是 http:// 或 https:// 开头，得到 %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("baseURL 缺少主机名")
+	}
+	if zenAllowPrivateBase() {
+		return nil
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("baseURL 指向内网/回环地址 %q 被拒绝（如需本地测试请设 ZEN_ALLOW_PRIVATE_BASE=true）", host)
+		}
+		return nil
+	}
+	lower := strings.ToLower(host)
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") ||
+		strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal") {
+		return fmt.Errorf("baseURL 指向内网主机 %q 被拒绝（如需本地测试请设 ZEN_ALLOW_PRIVATE_BASE=true）", host)
+	}
+	return nil
+}
+
+func zenAllowPrivateBase() bool {
+	v, ok := envBool("ZEN_ALLOW_PRIVATE_BASE")
+	return ok && v
 }
 
 // validateProxyList 校验代理列表格式: 支持 http/https/socks5/socks5h, 必须包含 host:port。
@@ -973,10 +1059,23 @@ func pickZenKey() string {
 			return k
 		}
 	}
-	// 第三轮：只剩停放中的 key。停放期未满时仍返回它——但调用方会先
-	// 检查 anyZenKeyParked() 并直接给出"今日额度已用完 + 恢复时间"的明确
-	// 错误，不会真的发出请求。这里返回它只为保持"有 key 可报"的形态，
-	// 让日志能指名是哪个 key 被停放。
+	// 第三轮：只剩"冷却中但未停放"的 key —— 瞬时限流，探一次是合理的
+	//（冷却只是"别太频繁"，不是"别发"）。
+	for i := 0; i < len(keys); i++ {
+		idx := (zenKeyIdx + i) % len(keys)
+		k := keys[idx]
+		if !parked(k) && eligible(k) {
+			zenKeyIdx = (idx + 1) % len(keys)
+			return k
+		}
+	}
+	// 第四轮：只剩停放中的 key（今日额度耗尽）。
+	//
+	// 这里必须排在最后、而不是像早先那样直接返回：混合池里"部分 key 停放、
+	// 其余 key 正在冷却"是常见形态，而调用方的 anyZenKeyParked() 快速失败
+	// 只在**所有** key 都停放时才触发。若第三轮就交出停放的 key，请求会真的
+	// 打到已知今日没额度的 key 上，还顺带 parkZenKey 二次退避（st.Backoff *= 2、
+	// probes++），把"每个停放区间只探一次"的记账搞乱。
 	for i := 0; i < len(keys); i++ {
 		idx := (zenKeyIdx + i) % len(keys)
 		k := keys[idx]
@@ -1076,15 +1175,23 @@ func uncoolZenKey(key string) {
 	zenKeyMu.Unlock()
 }
 
-// zenAnyKeyRotatable 是否还有"当前 key 之外、且未在冷却"的 key 可以马上换过去。
-// 决定 429 之后该不该睡眠重试：没有可换的 key 时，睡 30s 再打同一个已冷却的
-// key 只是在挂住客户端的连接（实测单 key 池一次请求挂 101s 才返回 429）。
-// 与 pickZenKey 不同：这里不推进 round-robin 游标，只是只读探测。
+// zenAnyKeyRotatable 是否还有"当前 key 之外、且未在冷却、且未被停放"的 key
+// 可以马上换过去。决定 429 之后该不该睡眠重试：没有可换的 key 时，睡 30s 再打
+// 同一个已冷却的 key 只是在挂住客户端的连接（实测单 key 池一次请求挂 101s 才
+// 返回 429）。与 pickZenKey 不同：这里不推进 round-robin 游标，只是只读探测。
+//
+// 停放（park）必须一起排除：parkZenKey 会把 key 从 zenKeyCool 里删掉，所以
+// "不在冷却"包含"已停放"。漏掉它，判定就会说"还有 key 可换"，于是睡眠重试
+// 打回同一个额度耗尽的 key —— 正是 101s 挂起那个 bug 换了条路回来。
 func zenAnyKeyRotatable(cur string) bool {
 	for _, k := range getZenConfig().Keys {
-		if k != "" && k != cur && !zenKeyCooling(k) {
-			return true
+		if k == "" || k == cur || zenKeyCooling(k) {
+			continue
 		}
+		if _, parked := zenKeyParked(k); parked {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -2329,12 +2436,17 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 	if maxKeySwitches > max429KeySwitches {
 		maxKeySwitches = max429KeySwitches
 	}
+	// sleeps 是"等一会儿再用同一个 key"的预算，与 keySwitches 分开计。
+	// 早先两者共用 attempt：换 key 的 continue 也会 ++attempt，于是 key 换得
+	// 多的请求会把睡眠重试预算吃光——网络抖动 + 限流同时出现时反而一次都不重试，
+	// 而"更该重试"的正是这种场景。
+	sleeps := 0
 	// 2026-10-27: fresh session per API call (zenCallIdentity). Same
 	// session across retries of this call, fresh if the key switches
 	// or a 403 forces a refresh. See zen_session.go.
 	callIdent := newZenCallIdentity()
 
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt < maxZenAttempts; attempt++ {
 		// 全池停放（日额度耗尽）：与 chat 路径一致，不发上游往返，
 		// 直接给出带恢复时刻的错误。
 		if attempt == 0 && o.pinKey == "" && pinnedZenKey() == "" {
@@ -2413,12 +2525,13 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 				cooldownUpstreamProxy(pidx, 2*time.Minute)
 				log.Printf("  zen proxy failed (%v), cooldown exit %s for 2m", err, viaProxy)
 			}
-			if attempt < retries {
-				log.Printf("  zen responses network error (%v), retry %d/%d after %v", err, attempt+1, retries, delay)
+			if sleeps < retries {
+				log.Printf("  zen responses network error (%v), retry %d/%d after %v", err, sleeps+1, retries, delay)
 				if !sleepCtx(ctx, kit.WithRetryJitter(delay)) {
 					return nil, rateLimited, fmt.Errorf("client aborted during retry wait")
 				}
 				delay = zenRetryDelay(delay)
+				sleeps++
 				continue
 			}
 			return nil, rateLimited, fmt.Errorf("zen responses request: %w", err)
@@ -2517,25 +2630,9 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 			}
 			// 无 key 可换时快速失败，语义与 chat 路径一致（见那里的长注释）：
 			// 睡 30s 后必然重撞同一个已冷却的 key，只是把客户端连接挂住。
-			if attempt < retries && zenAnyKeyRotatable(key) {
-				wait := delay
-				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > wait {
-					wait = retryAfter
-				}
-				if wait > 30*time.Second {
-					wait = 30 * time.Second
-				}
-				log.Printf("  zen responses rate limited (%d), retry %d/%d after %v", resp.StatusCode, attempt+1, retries, wait)
-				if !sleepCtx(ctx, kit.WithRetryJitter(wait)) {
-					return nil, rateLimited, fmt.Errorf("client aborted during retry wait")
-				}
-				delay = zenRetryDelay(delay)
-				continue
-			}
-			if attempt < retries {
-				log.Printf("  zen responses rate limited (%d): no rotatable key, failing fast instead of sleeping %d more time(s)",
-					resp.StatusCode, retries-attempt)
-			}
+			// 同 chat 路径：429 不睡眠重试（睡完只会重撞同一个刚冷却的 key）。
+			log.Printf("  zen responses rate limited (%d): failing fast (key switching already attempted)",
+				resp.StatusCode)
 			// 限流不是"zen 挂了"：上游明确回了 HTTP 429，服务正常，只是这个
 			// key/身份当前超了窗口。把它计入故障转移会让一次瞬时节流把整个 zen
 			// 路由切走（cline 池为空时客户端直接吃 401），而限流本来已由 key
@@ -2593,6 +2690,9 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 		}
 		return nil, rateLimited, apiErr
 	}
+	// 循环上限兜底（maxZenAttempts）：正常路径全部 return/continue 有界，
+	// 走到这里说明计数器出了偏差，宁可失败也不要空转。
+	return nil, rateLimited, fmt.Errorf("zen responses: retry budget exhausted")
 }
 
 // callZenAPI 调用 zen 上游,带限流防御: 并发信号量 + 指数退避重试 + 代理冷却 + 故障计数
@@ -2638,20 +2738,23 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 	// keySwitches 限制"一次客户端请求最多冷却几个 key"。
 	//
 	// 2026-10-30 实测事故：一个 291 条消息的大请求 429 后，下面的换 key 分支
-	// 用 `continue` 绕过了 `attempt < retries` 判断，而循环头是 `for attempt := 0; ;`
-	// 无上界——结果 4 秒内把池里 5 个 key 全部冷却到 24h（maxCooldown）。
-	// 一次请求的规模问题因此被放大成"整池被封"的假象。
+	// 用 `continue` 绕过了重试判断，循环头又没有上界——结果 4 秒内把池里 5 个
+	// key 全部冷却到 24h（maxCooldown）。一次请求的规模问题因此被放大成
+	// "整池被封"的假象。
 	//
-	// 语义区分：睡眠重试（attempt < retries）是"等一等再用同一个 key"，成本低；
+	// 语义区分：睡眠重试（sleeps < retries）是"等一等再用同一个 key"，成本低；
 	// 换 key 会永久冷却一个 key，成本高且不可逆。故单独计数、单独设上限，
 	// 不占用重试预算：keySwitches 上限 = retries（默认 3），即一次请求最多
-	// 触碰 1 + 3 = 4 个 key，最多冷却 4 个。这与"重试次数"是两件事，
-	// 不能共用一个计数器。
+	// 触碰 1 + 3 = 4 个 key，最多冷却 4 个。两者必须是两个计数器——
+	// 早先共用一个 attempt 时，换 key 的 continue 也会 ++attempt，
+	// 换得多就把睡眠预算吃光（网络抖动 + 限流同时出现时一次都不重试）。
 	keySwitches := 0
 	maxKeySwitches := retries
 	if maxKeySwitches > max429KeySwitches {
 		maxKeySwitches = max429KeySwitches
 	}
+	// sleeps 与 keySwitches 分开计（见 callZenResponsesAPI 同注）。
+	sleeps := 0
 	// 2026-10-27: fresh session per API call (zenCallIdentity). Same
 	// session across retries of this call, fresh if the key switches
 	// or a 403 forces a refresh. See zen_session.go.
@@ -2666,7 +2769,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 	// mirroring callZenResponsesAPI.
 	retryKey := ""
 
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt < maxZenAttempts; attempt++ {
 		// 全池停放（日额度耗尽）：连一个上游往返都不发，直接给出带恢复
 		// 时刻的明确错误。这是停放的真正收益——IDE 的重试风暴不会再
 		// 逐个变成上游请求，用户看到的是"X 点恢复"而不是一串 429。
@@ -2742,12 +2845,13 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 				log.Printf("  zen proxy failed (%v), cooldown exit %s for 2m", err, viaProxy)
 			}
 			// 网络错误:退避重试(不计入故障转移,瞬时可恢复);ctx 取消时中断等待
-			if attempt < retries {
-				log.Printf("  zen network error (%v), retry %d/%d after %v", err, attempt+1, retries, delay)
+			if sleeps < retries {
+				log.Printf("  zen network error (%v), retry %d/%d after %v", err, sleeps+1, retries, delay)
 				if !sleepCtx(ctx, kit.WithRetryJitter(delay)) {
 					return nil, rateLimited, fmt.Errorf("client aborted during retry wait")
 				}
 				delay = zenRetryDelay(delay)
+				sleeps++
 				continue
 			}
 			return nil, rateLimited, fmt.Errorf("zen request: %w", err)
@@ -2833,26 +2937,14 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 			// IDE 侧看起来像"网关卡死"，而真实结论在第一秒就已确定。
 			// 故：还有别的 key 可轮转 → 上面的换 key 分支已 continue；
 			// 没有 → 立即返回 429，把退避权交还给客户端。
-			if attempt < retries && zenAnyKeyRotatable(key) {
-				// Retry-After 封顶 30s：更长的等待没有意义（槽位被占、客户端早已离开）
-				wait := delay
-				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > wait {
-					wait = retryAfter
-				}
-				if wait > 30*time.Second {
-					wait = 30 * time.Second
-				}
-				log.Printf("  zen rate limited (%d), retry %d/%d after %v", resp.StatusCode, attempt+1, retries, wait)
-				if !sleepCtx(ctx, kit.WithRetryJitter(wait)) {
-					return nil, rateLimited, fmt.Errorf("client aborted during retry wait")
-				}
-				delay = zenRetryDelay(delay)
-				continue
-			}
-			if attempt < retries {
-				log.Printf("  zen rate limited (%d): no rotatable key, failing fast instead of sleeping %d more time(s)",
-					resp.StatusCode, retries-attempt)
-			}
+			// 429 一律不睡眠重试，交由客户端退避。
+			//
+			// 睡眠重试在 429 上没有正收益：能推进的只有"换 key"（上面已做），
+			// 而睡完打回的是同一个刚被 cooldownZenKey 冻结的 key。历史实测
+			// 一次请求因此挂 101 秒（4 次往返 × 30s 睡眠），IDE 侧表现为网关
+			// 卡死，而结论在第一秒就已确定。这里直接返回 429。
+			log.Printf("  zen rate limited (%d): failing fast (key switching already attempted)",
+				resp.StatusCode)
 			// 限流不是"zen 挂了"：上游明确回了 HTTP 429，服务正常，只是这个
 			// key/身份当前超了窗口。把它计入故障转移会让一次瞬时节流把整个 zen
 			// 路由切走（cline 池为空时客户端直接吃 401），而限流本来已由 key
@@ -2907,6 +2999,8 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 		}
 		return nil, rateLimited, apiErr
 	}
+	// 循环上限兜底（maxZenAttempts），同 callZenResponsesAPI。
+	return nil, rateLimited, fmt.Errorf("zen: retry budget exhausted")
 }
 
 // sleepCtx ctx 感知的睡眠；返回 false 表示等待期间被取消。

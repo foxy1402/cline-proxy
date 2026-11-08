@@ -36,15 +36,12 @@ var (
 	zenDepPath    string
 )
 
-// zenDepFile 别名持久化路径（与 .zen-sessions.json / .zen-endpoints.json 同目录）。
-func zenDepFile() string {
-	zenDepMu.Lock()
-	defer zenDepMu.Unlock()
-	return zenDepPathLocked()
-}
-
 // zenDepPathLocked 路径解析（调用方须持有 zenDepMu）。load/save 都在锁内
-// 走这里，避免 zenDepFile 的重入死锁。
+// 走这里。
+//
+// 早先还有一个 zenDepFile() 包着同一把锁，只差一个字，任何在锁内调用它
+// 的地方都会自死锁（Go 的 Mutex 不可重入，且这种死锁不可 recover）。它
+// 零调用点，已删除 —— 别再把它加回来。
 func zenDepPathLocked() string {
 	if zenDepPath == "" {
 		zenDepPath = kit.ResolveDataPath(".zen-model-aliases.json")
@@ -69,13 +66,52 @@ func loadZenDepsLocked() {
 		log.Printf("zen model aliases parse failed, ignoring (backup: %s.corrupt): %v", p, err)
 		return
 	}
+	loaded := 0
+	rejected := 0
 	for k, e := range m {
-		if e != nil && e.Replacement != "" {
-			zenDepAliases[k] = e
+		if e == nil || e.Replacement == "" {
+			continue
+		}
+		fk, fr := normalizeZenModelID(k), normalizeZenModelID(e.Replacement)
+		if fr == "" || fk == fr {
+			// 自环（A→A）：resolveZenModel 的递归兜底会立刻再查同一个 id。
+			log.Printf("zen model alias %q -> %q is a self-reference, dropped", k, e.Replacement)
+			rejected++
+			continue
+		}
+		zenDepAliases[k] = e
+		loaded++
+	}
+	// 环检测：A→B→A 这类链会让 resolveZenModel 来回递归。那里已有深度上限
+	// 兜底（不会崩），但把坏数据留在内存里等于每个请求白走一趟递归并刷日志，
+	// 所以在装载时就把落在环上的起始条目丢掉。
+	for k := range zenDepAliases {
+		seen := map[string]bool{}
+		cur := normalizeZenModelID(k)
+		cyclic := false
+		for i := 0; i <= zenAliasMaxDepth; i++ {
+			if seen[cur] {
+				cyclic = true
+				break
+			}
+			seen[cur] = true
+			e, ok := zenDepAliases[cur]
+			if !ok {
+				break
+			}
+			cur = normalizeZenModelID(e.Replacement)
+		}
+		if cyclic {
+			log.Printf("zen model alias chain starting at %q is cyclic, dropped", k)
+			delete(zenDepAliases, k)
+			rejected++
 		}
 	}
-	if len(zenDepAliases) > 0 {
+	if loaded > 0 {
 		log.Printf("zen model aliases loaded: %d mapping(s)", len(zenDepAliases))
+	}
+	if rejected > 0 {
+		log.Printf("zen model aliases: %d invalid mapping(s) dropped", rejected)
 	}
 }
 

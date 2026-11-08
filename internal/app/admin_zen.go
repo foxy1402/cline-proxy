@@ -137,7 +137,16 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		next.Keys = []string{*patch.Key}
 	}
 	if patch.BaseURL != nil && *patch.BaseURL != "" {
-		next.BaseURL = strings.TrimRight(*patch.BaseURL, "/")
+		// 必须校验：BaseURL 会被拼成上游请求地址，并**带上 zen API key**。
+		// 目录同步来的 base 有 zenValidateRegistryBase 把关，管理面板这条却
+		// 原本直接赋值 —— 等于开了一个"把 key 发到任意主机 + 读内网响应"
+		// 的口子（SSRF + 凭据外泄）。两者用同一个校验。
+		base := strings.TrimRight(*patch.BaseURL, "/")
+		if err := validateZenUpstreamBase(base); err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+			return
+		}
+		next.BaseURL = base
 	}
 	if patch.Proxies != nil {
 		if err := validateProxyList(patch.Proxies); err != nil {
@@ -412,7 +421,8 @@ func testZenKey(key string, index int, modelID string) (map[string]any, string) 
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	// 上限同 admin.go：探测上游可能被配成任意地址，不能无限读。
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
 		result["httpStatus"] = resp.StatusCode
 		result["reason"] = fmt.Sprintf("API %d: %s", resp.StatusCode, kit.Truncate(string(bodyBytes), 300))

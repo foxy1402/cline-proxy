@@ -11,6 +11,31 @@ import (
 	"cline-go-proxy/internal/kit"
 )
 
+// withCachedModel 往模型缓存里注入一条测试模型并在测试结束后移除。
+//
+// 为什么不直接用种子表里的模型：种子表随官方 free feed 变化（2026-11 就整批
+// 换过），而这些测试真正关心的是"命名约定判定漏判 → 学习 → 流式重试"这条
+// 路径，需要一个不含 ":" 之外特征的 id。依赖线上列表会让测试莫名其妙地红。
+func withCachedModel(t *testing.T, id string) {
+	t.Helper()
+	modelsMu.Lock()
+	if modelsCache == nil {
+		modelsCache = make(map[string]*ModelInfo)
+	}
+	saved, had := modelsCache[id]
+	modelsCache[id] = &ModelInfo{ID: id, Source: "free", Provider: "probe", Cost: "free", Status: ModelActive}
+	modelsMu.Unlock()
+	t.Cleanup(func() {
+		modelsMu.Lock()
+		if had {
+			modelsCache[id] = saved
+		} else {
+			delete(modelsCache, id)
+		}
+		modelsMu.Unlock()
+	})
+}
+
 func fakeUpstream(status int, body string) *http.Response {
 	return &http.Response{
 		StatusCode: status,
@@ -47,8 +72,11 @@ func TestCallClineAutoStreamLearnsAndRetries(t *testing.T) {
 		return fakeUpstream(200, "data: {\"choices\":[]}\n\n"), &Account{Email: "second@x"}, nil
 	}
 
-	// 种子表里的模型：normalizeRequestModel 会保留这个 id（不在表里会被换默认模型）
-	params := map[string]any{"model": "z-ai/glm-5.3-flash"}
+	// 含 ":" 的 id 被约定判定"无需流式"，正是要学习的路径
+	const probeModel = "probe/needs-stream:free"
+	withCachedModel(t, probeModel)
+
+	params := map[string]any{"model": probeModel}
 	resp, acc, streamed, err := callClineAutoStream(context.Background(), params, false, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -65,10 +93,10 @@ func TestCallClineAutoStreamLearnsAndRetries(t *testing.T) {
 	if acc == nil || acc.Email != "second@x" {
 		t.Fatalf("account of the retry must be returned, got %+v", acc)
 	}
-	if !clineStreamRequired("z-ai/glm-5.3-flash") {
+	if !clineStreamRequired(probeModel) {
 		t.Fatal("model must be learned as stream-required")
 	}
-	if !modelNeedsStream("z-ai/glm-5.3-flash") {
+	if !modelNeedsStream(probeModel) {
 		t.Fatal("learned model must be force-streamed on later requests")
 	}
 }
@@ -90,7 +118,9 @@ func TestCallClineAutoStreamRetryFailureKeepsOriginalError(t *testing.T) {
 		return nil, nil, context.DeadlineExceeded
 	}
 
-	params := map[string]any{"model": "z-ai/glm-5.3-flash"}
+	const probeModel = "probe/retry-fail:free"
+	withCachedModel(t, probeModel)
+	params := map[string]any{"model": probeModel}
 	resp, _, streamed, err := callClineAutoStream(context.Background(), params, false, false)
 	if err == nil {
 		t.Fatal("retry failure must surface the upstream error, got nil")
@@ -104,7 +134,7 @@ func TestCallClineAutoStreamRetryFailureKeepsOriginalError(t *testing.T) {
 	if !strings.Contains(err.Error(), "empty response content") {
 		t.Fatalf("the first failure should be reported, got %v", err)
 	}
-	if !clineStreamRequired("z-ai/glm-5.3-flash") {
+	if !clineStreamRequired(probeModel) {
 		t.Fatal("model must still be learned even when the retry failed")
 	}
 }
@@ -124,7 +154,9 @@ func TestCallClineAutoStreamIgnoresPlain500(t *testing.T) {
 		return fakeUpstreamErr(500, `{"error":"Internal server error"}`)
 	}
 
-	params := map[string]any{"model": "z-ai/glm-5.3-flash"}
+	const probeModel = "probe/plain500:free"
+	withCachedModel(t, probeModel)
+	params := map[string]any{"model": probeModel}
 	_, _, streamed, err := callClineAutoStream(context.Background(), params, false, false)
 	if err == nil {
 		t.Fatal("plain 500 must still be an error")
@@ -132,7 +164,7 @@ func TestCallClineAutoStreamIgnoresPlain500(t *testing.T) {
 	if streamed || calls != 1 {
 		t.Fatalf("plain 500 must pass through untouched: streamed=%v calls=%d", streamed, calls)
 	}
-	if clineStreamRequired("z-ai/glm-5.3-flash") {
+	if clineStreamRequired(probeModel) {
 		t.Fatal("transient 500 must not be learned as a model property")
 	}
 }

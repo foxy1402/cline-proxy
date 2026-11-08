@@ -63,7 +63,7 @@ func TestEndpointLearnOnlyPersistsWhenRetrySucceeds(t *testing.T) {
 	// 只注册这一个模型，避免污染其他测试的模型表
 	savedModels := zenModels
 	savedAliases := zenAliases
-	setZenModelForTest(model, "")
+	withZenModelForTest(t, model, "")
 	defer func() {
 		zenModelsMu.Lock()
 		zenModels, zenAliases = savedModels, savedAliases
@@ -112,12 +112,24 @@ func TestEndpointLearnOnlyPersistsWhenRetrySucceeds(t *testing.T) {
 	}
 }
 
-// setZenModelForTest 在测试里挂一个独立的模型表。
-func setZenModelForTest(id, upstream string) {
+// withZenModelForTest 在测试里挂一张独立的模型表，并在测试结束后恢复原值。
+//
+// 必须恢复：它会**整个替换**包级 zenModels/zenAliases。早先那个不恢复的版本
+// 在整套 -shuffle=on 下会让后续测试看到"只剩一个模型、别名表空掉"的状态，
+// 而 initZenModels 因 len>0 直接返回，seed 别名再也补不回来，于是
+// TestZenSeedBootstrapAliasesResolve 随机变红。
+func withZenModelForTest(t *testing.T, id, upstream string) {
+	t.Helper()
 	zenModelsMu.Lock()
+	savedModels, savedAliases := zenModels, zenAliases
 	zenModels = map[string]*ZenModel{id: {ID: id, Context: 200000, Output: 32768, Source: "live", Upstream: upstream}}
 	zenAliases = map[string]*ZenModel{}
 	zenModelsMu.Unlock()
+	t.Cleanup(func() {
+		zenModelsMu.Lock()
+		zenModels, zenAliases = savedModels, savedAliases
+		zenModelsMu.Unlock()
+	})
 }
 
 // currentZenUpstream 测试辅助：读模型当前生效的端点。
@@ -173,7 +185,7 @@ func TestResponsesEntryUsesNativeEndpointForResponsesModel(t *testing.T) {
 
 	model := "native-resp-model"
 	savedModels, savedAliases := zenModels, zenAliases
-	setZenModelForTest(model, "responses")
+	withZenModelForTest(t, model, "responses")
 	defer func() {
 		zenModelsMu.Lock()
 		zenModels, zenAliases = savedModels, savedAliases
@@ -229,7 +241,7 @@ func TestZenHeadersOnTheWire(t *testing.T) {
 	defer setZenConfig(savedCfg)
 
 	savedModels, savedAliases := zenModels, zenAliases
-	setZenModelForTest("wire-zen-model", "") // chat endpoint
+	withZenModelForTest(t, "wire-zen-model", "") // chat endpoint
 	defer func() {
 		zenModelsMu.Lock()
 		zenModels, zenAliases = savedModels, savedAliases

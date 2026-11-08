@@ -29,3 +29,10 @@ override.md
 .github/
 TODO.md
 bt-data/
+
+# keep the build context lean; tests and agent scratch never reach the builder
+.zcode/
+.zcodeignore
+*_test.go
+**/*_test.go
+cline-accounts-export*.json

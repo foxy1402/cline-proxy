@@ -97,9 +97,27 @@ func loadPool() *AccountPool {
 	}
 	pool = &p
 	if pool.DefaultModel != "" {
-		defaultModel = pool.DefaultModel
+		setDefaultModelValue(pool.DefaultModel)
 	}
 	return pool
+}
+
+// setDefaultModelValue 写默认模型全局。必须持 modelsMu：getDefaultModel 在
+// modelsMu 下读它，而 string 是两个机器字，无锁写会让读方看到"新长度 + 旧指针"
+// 并可能越界。它是模型状态（不是账号池状态），所以归 modelsMu 管。
+func setDefaultModelValue(modelID string) {
+	initModelsCache()
+	modelsMu.Lock()
+	defaultModel = modelID
+	modelsMu.Unlock()
+}
+
+// getDefaultModelValue 无锁安全地读默认模型全局（面板展示用）。
+func getDefaultModelValue() string {
+	initModelsCache()
+	modelsMu.Lock()
+	defer modelsMu.Unlock()
+	return defaultModel
 }
 
 // setDefaultModel 持久化默认模型：更新内存全局并写入账号池文件
@@ -111,7 +129,7 @@ func setDefaultModel(modelID string) {
 	if !ok {
 		return
 	}
-	defaultModel = modelID
+	setDefaultModelValue(modelID)
 	p := loadPool()
 	poolMu.Lock()
 	p.DefaultModel = modelID

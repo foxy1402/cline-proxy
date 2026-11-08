@@ -323,18 +323,29 @@ func StartProxy(host string, port int) error {
 		usageFn := accountUsageFn(acc, params)
 
 		if isStream {
-			handleStreamResponseWithUsage(w, resp, usageFn)
+			handleStreamResponseWithUsage(w, resp, usageFn, normalizeRequestModel(model))
 			return
 		}
 
 		if upstreamStream {
-			out, err := collectStreamResponse(resp)
+			// 传真实模型名给自愈记账：上游 0 字节即报错时帧里没有 model，
+			// 只能靠这里。用 normalizeRequestModel 保证与实际调用的名字一致。
+			out, err := collectStreamResponse(resp, normalizeRequestModel(model))
 			if err != nil {
+				// collectStreamResponse 内部已经按帧内 model（拿不到时用我们传的
+				// hint）记过失败了。这里**不能**再记一次：两条路径在"帧内 model
+				// 等于请求 model"这个最常见的形态下同时命中，FailStreak 一次失败
+				// 就 +2，阈值 3 实际两次就触发。
 				writeJSON(w, http.StatusInternalServerError, map[string]any{
 					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 				})
 				return
 			}
+			// 流聚合成功 = 这个模型真的能干活，此时才清失败计数。
+			// 用响应里自报的 model 记账，不要用 normalizeRequestModel：
+			// 它在缓存里查不到请求的 id 时会返回**默认模型**，等于拿 A 的成功
+			// 去清 B 的失败计数（真模型 streak 不变，而健康模型被莫名"复活"）。
+			recordModelSuccess(servedModelOf(out, model))
 			if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
 				usageFn(u)
 			}
@@ -698,11 +709,16 @@ func handleZenResponsesNative(w http.ResponseWriter, r *http.Request, params map
 		// 反向纠错：若 responses 路径上报"该用 chat"（未来反向模型），
 		// 学回 chat 并改走 chat 路径重试一次。
 		if isWrongEndpointResponses(err) {
+			// 这里已经学到了正确答案（该走 chat），不能再让调用方把
+			// "responses 可用"落盘覆盖掉它 —— 返回 false 表示"不要记 responses"。
+			// 早先返回 true，调用方据此 learnZenEndpoint(zm.ID,"responses")，
+			// 把刚学到的 chat 覆盖成刚被拒绝的 responses，模型就此永久钉死在
+			// 错误端点上，每个请求白付两次失败往返。
 			learnZenEndpoint(zm.ID, "")
 			log.Printf("  zen endpoint auto-learn: model=%s responses rejected (%v), retrying chat",
 				zm.ID, kit.Truncate(err.Error(), 120))
 			handleZenChatDirect(w, r, params, zm, tracker)
-			return true
+			return false
 		}
 		log.Printf("  zen responses api error: %v", err)
 		tracker.rec.RateLimited = rateLimited
@@ -804,7 +820,11 @@ func emitChatAsSSE(w http.ResponseWriter, chat map[string]any, usageFn func(map[
 	content, _ := msg["content"].(string)
 	for len(content) > 0 {
 		n := 2048
-		if len(content) < n {
+		if len(content) <= n {
+			// 必须用 <=：内容长度正好是 2048 的整数倍时，下面探测 content[n]
+			// 会越界 panic（len==2048 时 content[2048] 下标越界）。recover 兜得住，
+			// 但 SSE 头已经发出去了，客户端只会看到一条没有 finish_reason /
+			// [DONE] 的截断流。
 			n = len(content)
 		} else {
 			// 不能在多字节字符中间切断：SSE 消费端逐块做 UTF-8 解码，半个字符会被
@@ -1042,10 +1062,24 @@ func callClineAPI(ctx context.Context, params map[string]any, stream bool, usePr
 
 		resp, err := clineAPIWithAccount(ctx, params, stream, useProxies, acc)
 		if err == nil {
+			// 注意：这里**不能**记 success。上游常常先回 200 再在 SSE 帧里
+			// 报错（provider 挂掉时就是这样），此时 API 层是"成功"的，真正的
+			// 失败要等调用方聚合流才知道。在这里清零会让 failStreak 永远
+			// 在 1↔2 之间抖动、达不到阈值（实测踩过）。
+			// 成功的清零放在真正消费完流之后，见 markModelServed。
 			return resp, acc, nil
 		}
 		lastErr = err
 		var ce *clineAPIError
+		if errors.As(err, &ce) {
+			// 模型级错误（404 model not found / 500 inference failed /
+			// stream_initialization_failed）与账号无关：换账号救不回来，但反复
+			// 出现说明这个免费模型确实坏了 —— 记一次，累计到阈值就下架冷却。
+			// 429 / 鉴权类不算模型故障，isModelLevelFailure 会滤掉。
+			if id, _ := params["model"].(string); id != "" {
+				recordModelFailure(id, ce.Status, ce.Body)
+			}
+		}
 		if !errors.As(err, &ce) {
 			// 网络/令牌/取消等错误：不换账号（换账号无助于网络层故障，且
 			// 取消必须立即终止）。直接返回。
@@ -1270,8 +1304,8 @@ func getMsgCount(params map[string]any) int {
 
 // handleStreamResponseWithUsage 默认不透传纯 usage 收尾帧（cline 路径从不向
 // 上游要 include_usage，也不该凭空多给客户端一帧）。
-func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
-	handleStreamResponseUsage(w, upstream, onUsage, false)
+func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), hintModel ...string) {
+	handleStreamResponseUsage(w, upstream, onUsage, false, hintModel...)
 }
 
 // clientWantsStreamUsage 客户端是否自己要求了流式 usage 帧
@@ -1304,7 +1338,18 @@ func isUsageOnlyChunk(obj map[string]any) bool {
 // handleStreamResponseUsage 流式转发上游 SSE。keepUsageOnly 决定是否把纯 usage
 // 收尾帧也下发给客户端：zen 路径为统计向上游要 include_usage，客户端没要时不能
 // 多给它一帧没预期的数据。
-func handleStreamResponseUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), keepUsageOnly bool) {
+//
+// hintModel 用于自愈记账：上游 0 字节即报错时帧里没有 model，只能靠调用方给。
+// 流式是客户端的主力路径，如果这里不记 success，一个曾经失败过的模型
+// FailStreak 永远清不掉——一旦到过阈值，之后每次模型级错误都会再冷却 30 分钟。
+func handleStreamResponseUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any), keepUsageOnly bool, hintModel ...string) {
+	hint := ""
+	if len(hintModel) > 0 {
+		hint = hintModel[0]
+	}
+	// 记账用：优先帧内 model（上游真实服务的模型），回退到调用方提示。
+	served := ""
+	streamErr := ""
 	// Check Flusher support BEFORE writing any headers
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1392,6 +1437,22 @@ func handleStreamResponseUsage(w http.ResponseWriter, upstream *http.Response, o
 	w.WriteHeader(http.StatusOK)
 
 	reader := bufio.NewReader(upstream.Body)
+	// 流结束（正常 EOF 或中途断流）时记账一次：命中模型级错误就记失败，
+	// 否则算成功并清零 streak。这是流式客户端唯一的自愈信号来源。
+	defer func() {
+		mdl := served
+		if mdl == "" {
+			mdl = hint
+		}
+		if mdl == "" {
+			return
+		}
+		if streamErr != "" {
+			recordModelFailure(mdl, http.StatusOK, streamErr)
+			return
+		}
+		recordModelSuccess(mdl)
+	}()
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -1407,6 +1468,7 @@ func handleStreamResponseUsage(w http.ResponseWriter, upstream *http.Response, o
 			// Anthropic 路径（proxy.go 的 anthropic stream upstream error）和
 			// Responses 路径（responses.go 的 response.failed）一致。
 			log.Printf("  upstream stream interrupted (mid-stream read error): %v", err)
+			streamErr = "upstream stream interrupted: " + err.Error()
 			errChunk := map[string]any{
 				"error": map[string]any{
 					"message": kit.Truncate("upstream stream interrupted: "+err.Error(), 300),
@@ -1434,6 +1496,23 @@ func handleStreamResponseUsage(w http.ResponseWriter, upstream *http.Response, o
 			// Try to normalize the response
 			var obj map[string]any
 			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+				if m, ok := obj["model"].(string); ok && m != "" {
+					served = m
+				}
+				// 帧内错误：上游常回 200 再在流里报错（provider 挂掉时如此）。
+				// 记下来供收尾记账判定，并原样透传给客户端（不吞错误）。
+				if e, ok := obj["error"]; ok && e != nil {
+					msg := ""
+					if em, ok := e.(map[string]any); ok {
+						msg, _ = em["message"].(string)
+					}
+					if msg == "" {
+						msg = strings.TrimSpace(fmt.Sprint(e))
+					}
+					if msg != "" && msg != "<nil>" {
+						streamErr = msg
+					}
+				}
 				if onUsage != nil {
 					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 						onUsage(u)
@@ -1600,7 +1679,22 @@ func isSSELine(line string) bool {
 	return false
 }
 
-func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
+// servedModelOf 取上游自报的模型名，取不到才回退到请求里的模型。
+// 自愈记账必须记"真正干活的模型"：normalizeRequestModel 在缓存 miss 时会
+// 返回默认模型，用它记账会把成功/失败记到别的模型头上。
+func servedModelOf(resp map[string]any, requested string) string {
+	if m, ok := resp["model"].(string); ok && m != "" {
+		return m
+	}
+	return requested
+}
+
+// collectStreamResponse 把上游 chat SSE 聚合成一条 chat JSON。
+//
+// hintModel 用于自愈记账：上游可能在**发出任何帧之前**就报错（provider 整个
+// 挂掉时就是这样，0 字节就 error 帧），此时帧里没有 model 字段可用，只能靠
+// 调用方传入的模型名。传空串则退化为"只信帧内的 model"。
+func collectStreamResponse(upstream *http.Response, hintModel ...string) (map[string]any, error) {
 	// 自己关掉响应体：本函数把 body 整个读完，所有权理应在此结束。兄弟函数
 	// responsesSSEToChat 一直这么做；这里不关会让连接既不回收也不复用，在长跑
 	// 容器里按请求数泄漏（压缩路径每次摘要都走这条）。
@@ -1702,6 +1796,17 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 					msg = strings.TrimSpace(fmt.Sprint(e))
 				}
 				if msg != "" && msg != "<nil>" {
+					// 模型级自愈：provider 挂掉时上游仍然回 200，错误藏在 SSE
+					// 帧里（2026-11-08 实测 laguna 就是这样，API 层完全看不出问题）。
+					// 优先用帧内自报的 model；0 字节即报错时帧里没有 model，
+					// 退回调用方给的 hintModel。
+					failModel := model
+					if failModel == "" && len(hintModel) > 0 {
+						failModel = hintModel[0]
+					}
+					if failModel != "" {
+						recordModelFailure(failModel, http.StatusOK, msg)
+					}
 					return nil, fmt.Errorf("upstream stream error after %d bytes: %s", content.Len(), msg)
 				}
 			}
@@ -3451,11 +3556,20 @@ func parseHumanDuration(s string) time.Duration {
 // isClineQuotaExhausted 从 429 错误体判断是否为配额耗尽（而非瞬时限流）。
 // 只有明确的配额措辞才返回 true；429 缺少可解析时长时用它决定兜底冷却长度：
 // 配额耗尽 → 18h，其余 → 20min 短冷却。
+//
+// 关键词必须**足够具体**：早先的列表里有裸的 "exceeded"，而瞬时限流的典型
+// 正文就是 "Rate limit exceeded" —— 于是一次没带 Retry-After 的普通限流会把
+// 健康账号冷却 18 小时，每个账号来一发整个池子就空了。只认同时表达"额度"
+// 语义的组合，不认任何单独的 "limit"/"exceeded"。
 func isClineQuotaExhausted(body string) bool {
 	low := strings.ToLower(body)
 	for _, kw := range []string{
-		"quota", "exceeded", "insufficient", "out of credit", "no credits",
-		"daily limit", "monthly limit", "usage limit", "credit limit", "billing",
+		"quota exceeded", "quota exhausted", "exceeded your quota",
+		"insufficient quota", "insufficient credit", "insufficient balance",
+		"out of credit", "out of credits", "no credits", "no credit left",
+		"daily limit reach", "daily limit exceed", "monthly limit reach", "monthly limit exceed",
+		"usage limit reach", "usage limit exceed", "credit limit reach",
+		"billing hard limit", "free tier limit",
 	} {
 		if strings.Contains(low, kw) {
 			return true
