@@ -38,11 +38,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # -shuffle=on：测试套件曾经是顺序依赖的（包级 zenModels/
+      # -shuffle：测试套件曾经是顺序依赖的（包级 zenModels/
       # clineStreamLearned 被替换后不恢复），默认顺序永远绿、换序必红。
-      # 固定 seed 让失败可复现。CI 必须跑它，否则这类泄漏会一直藏着。
+      # seed 必须写成 -shuffle=<n>：go 没有 -shuffle.seed 这个 flag，传了会让
+      # test 二进制直接 "flag provided but not defined" 退出（2026-11-08 踩过）。
+      # 固定 seed 让失败可复现。
       - name: Test (shuffled)
-        run: go test ./... -count=1 -shuffle=on -shuffle.seed=1
+        run: go test ./... -count=1 -shuffle=1
 
       # -race：本仓库大量使用包级可变状态，而默认测试只覆盖串行路径。
       # Linux runner 有 cgo，可以跑；这是唯一能自动发现未加锁访问的关卡。
