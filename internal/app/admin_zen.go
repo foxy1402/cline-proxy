@@ -37,6 +37,7 @@ func handleZenConfig(w http.ResponseWriter, r *http.Request) {
 		"failoverCount":        cfg.FailoverCount,
 		"failoverMinutes":      cfg.FailoverMinutes,
 		"compaction":           cfg.Compaction,
+		"toolFilter":           cfg.ToolFilter,
 		"sessionRotateMinutes": cfg.SessionRotateMinutes,
 		"orgID":                cfg.OrgID,
 		"pinProxyPerKey":       pinProxyPerKeyEnabled(),
@@ -88,6 +89,13 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			SummaryModel *string `json:"summaryModel"`
 			MaxSummary   *int    `json:"maxSummary"`
 		} `json:"compaction"`
+		// 请求体积裁剪：指针/切片用于区分"未提交"与显式关闭或清空。
+		ToolFilter *struct {
+			Enabled        *bool    `json:"enabled"`
+			DenyPrefixes   []string `json:"denyPrefixes"`
+			DenyNames      []string `json:"denyNames"`
+			MaxDescription *int     `json:"maxDescription"`
+		} `json:"toolFilter"`
 	}
 	if err := json.Unmarshal(body, &patch); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON: " + err.Error()})
@@ -106,6 +114,7 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		FailoverCount:        cur.FailoverCount,
 		FailoverMinutes:      cur.FailoverMinutes,
 		Compaction:           cur.Compaction,
+		ToolFilter:           cur.ToolFilter,
 		SessionRotateMinutes: cur.SessionRotateMinutes,
 		OrgID:                cur.OrgID,
 		PinProxyPerKey:       cur.PinProxyPerKey,
@@ -184,6 +193,23 @@ func handleZenConfigUpdate(w http.ResponseWriter, r *http.Request) {
 			base.Auto = *patch.Compaction.Auto
 		}
 		next.Compaction = base
+	}
+	if patch.ToolFilter != nil {
+		base := cur.ToolFilter
+		if patch.ToolFilter.Enabled != nil {
+			base.Enabled = *patch.ToolFilter.Enabled
+		}
+		// 空数组是合法值（清空名单），nil 才是"未提交"。
+		if patch.ToolFilter.DenyPrefixes != nil {
+			base.DenyPrefixes = patch.ToolFilter.DenyPrefixes
+		}
+		if patch.ToolFilter.DenyNames != nil {
+			base.DenyNames = patch.ToolFilter.DenyNames
+		}
+		if patch.ToolFilter.MaxDescription != nil && *patch.ToolFilter.MaxDescription >= 0 {
+			base.MaxDescription = *patch.ToolFilter.MaxDescription
+		}
+		next.ToolFilter = base
 	}
 	setZenConfig(next)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: getZenConfig()})

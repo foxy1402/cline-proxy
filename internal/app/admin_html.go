@@ -637,6 +637,25 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
+  <div class="section-title"><span class="sec-ico"><svg viewBox="0 0 24 24"><path d="M3 6h18M6 6v13a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6M10 11h4"/></svg></span> Request size filter (shrink the upstream body)</div>
+  <div class="section-body">
+    <p class="hint" style="margin-top:0">A real IDE request is mostly tool schemas: a ZCode message measured 137 KB, of which 112 KB (82%) was 76 tool definitions — about 33k tokens for a single message, which the free daily quota cannot absorb. This filter drops client tools by name before the request goes upstream. The 12 required gate tools are never touched, and <code>parameters</code> are always kept in full — only the tool list and (optionally) description length are reduced. Disabled by default: dropping a tool removes it from the model's ability to call it.</p>
+    <div class="form-row">
+      <div class="field"><label>Filter client tools</label>
+        <select id="ocToolFilterEnabled"><option value="false">Off — forward every tool the IDE declares</option><option value="true">On — drop matching tools</option></select>
+      </div>
+      <div class="field"><label>Max description chars (0 = keep)</label><input type="text" id="ocToolFilterMaxDesc" placeholder="0"></div>
+    </div>
+    <div class="form-row">
+      <div class="field" style="flex:2"><label>Drop by name prefix (one per line)</label><textarea id="ocToolFilterPrefixes" rows="3" placeholder="mcp__" style="font-family:monospace;font-size:12px"></textarea></div>
+      <div class="field" style="flex:2"><label>Drop by exact name (one per line)</label><textarea id="ocToolFilterNames" rows="3" placeholder="CronCreate&#10;CreateWorkflow&#10;EnterPlanMode&#10;ExitPlanMode&#10;AskUserQuestion" style="font-family:monospace;font-size:12px"></textarea></div>
+    </div>
+    <p class="hint" style="margin-top:0">Starting suggestions: prefix <code>mcp__</code> (MCP tools are the largest single schemas and a given turn usually uses one or two); names <code>CronCreate</code>, <code>CreateWorkflow</code>, <code>EnterPlanMode</code>, <code>ExitPlanMode</code>, <code>AskUserQuestion</code> (several KB each, rarely needed in a coding turn). Every drop is logged with the bytes saved.</p>
+    <div class="form-actions"><button class="btn btn-primary" onclick="saveOcConfig()">Save filter</button></div>
+  </div>
+</div>
+
+<div class="section">
   <div class="section-title"><span class="sec-ico"><svg viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg></span> opencode model list
     <button class="btn btn-sm" onclick="refreshOcModels()" style="margin-left:auto">Sync now</button>
   </div>
@@ -1333,6 +1352,11 @@ async function loadOcConfig() {
     _('ocKeepTokens').value = c.compaction ? c.compaction.keepTokens : 8000;
     _('ocSummaryModel').value = c.compaction ? (c.compaction.summaryModel || '') : '';
     _('ocMaxSummary').value = c.compaction ? c.compaction.maxSummary : 4096;
+    const tf = c.toolFilter || {};
+    if (_('ocToolFilterEnabled')) _('ocToolFilterEnabled').value = String(!!tf.enabled);
+    if (_('ocToolFilterMaxDesc')) _('ocToolFilterMaxDesc').value = tf.maxDescription || 0;
+    if (_('ocToolFilterPrefixes')) _('ocToolFilterPrefixes').value = (tf.denyPrefixes || []).join('\n');
+    if (_('ocToolFilterNames')) _('ocToolFilterNames').value = (tf.denyNames || []).join('\n');
     const rt = c.runtime || {};
     _('ocFailoverInfo').innerHTML = rt.failoverActive
       ? '<span style="color:var(--danger)">Failover active (opencode unavailable, requests go to the cline pool)</span>'
@@ -1366,6 +1390,12 @@ async function saveOcConfig() {
       keepTokens: parseInt(_('ocKeepTokens').value) || 8000,
       summaryModel: _('ocSummaryModel').value.trim(),
       maxSummary: parseInt(_('ocMaxSummary').value) || 4096
+    },
+    toolFilter: {
+      enabled: _('ocToolFilterEnabled') ? _('ocToolFilterEnabled').value === 'true' : false,
+      denyPrefixes: _('ocToolFilterPrefixes') ? _('ocToolFilterPrefixes').value.split('\n').map(s => s.trim()).filter(Boolean) : [],
+      denyNames: _('ocToolFilterNames') ? _('ocToolFilterNames').value.split('\n').map(s => s.trim()).filter(Boolean) : [],
+      maxDescription: _('ocToolFilterMaxDesc') ? (Math.max(0, parseInt(_('ocToolFilterMaxDesc').value, 10) || 0)) : 0
     }
   };
   try {

@@ -320,6 +320,10 @@ type zenConfigData struct {
 	FailoverCount   int              `json:"failoverCount"`   // 触发故障转移的连续失败次数,默认 3
 	FailoverMinutes int              `json:"failoverMinutes"` // 故障转移窗口(分钟),默认 5
 	Compaction      zenCompactConfig `json:"compaction"`
+	// ToolFilter 请求体积裁剪（默认关闭）。按前缀/名单丢弃客户端工具、可选
+	// 截断过长描述；gate 占位工具永不参与过滤。背景与实测数据见
+	// zen_toolfilter.go 顶部注释（tools 占 ZCode 单请求 82% 体积）。
+	ToolFilter zenToolFilterConfig `json:"toolFilter"`
 	// SessionRotateMinutes 粘性会话本地轮换周期（分钟），默认 120（2 小时）。
 	// 0 = 永不轮换（沿用旧行为，长跑后首个请求会因会话老化而变慢）。
 	SessionRotateMinutes int `json:"sessionRotateMinutes"`
@@ -353,6 +357,9 @@ func defaultZenConfig() *zenConfigData {
 			KeepTokens: 8000,
 			MaxSummary: 4096,
 		},
+		// 体积裁剪默认关闭：丢工具会削减模型可用能力，必须由使用者显式开启。
+		// 开启后按默认名单（丢弃 mcp__* 前缀工具）工作。
+		ToolFilter: defaultZenToolFilter(),
 	}
 }
 
@@ -1303,6 +1310,13 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 	delete(body, "functions")
 	delete(body, "function_call")
 	clientTools := zenClientTools(params)
+	// 体积裁剪（默认关闭）：先裁客户端工具，再合并 gate 占位工具——
+	// gate 工具是过闸必需，绝不参与过滤。裁剪结果只影响本次上游 body。
+	if cfg, on := zenToolFilterActive(); on && len(clientTools) > 0 {
+		var st zenFilterToolStats
+		clientTools, st = zenFilterClientToolsChat(clientTools, cfg)
+		logZenToolFilter("chat", st)
+	}
 	if len(clientTools) == 0 {
 		body["tools"] = zenGateTools()
 	} else {
@@ -1705,7 +1719,14 @@ func buildZenResponsesBody(params map[string]any, modelID string, promptKey stri
 	//（chat 嵌套形态 400 missing name、tool_choice=none 400 only auto allowed）。
 	// 恒注入 11 个规范工具名 + auto——auto 是 responses 端点唯一接受的值。
 	// 客户端工具（chat 嵌套或已是 flat）优先于同名 gate stub，schema 才不丢。
-	body["tools"] = zenMergeResponsesTools(zenClientFlatTools(params))
+	flatTools := zenClientFlatTools(params)
+	// 体积裁剪（默认关闭）：同 chat 路径，只裁客户端工具，gate stub 不动。
+	if cfg, on := zenToolFilterActive(); on && len(flatTools) > 0 {
+		var st zenFilterToolStats
+		flatTools, st = zenFilterClientToolsFlat(flatTools, cfg)
+		logZenToolFilter("responses", st)
+	}
+	body["tools"] = zenMergeResponsesTools(flatTools)
 	body["tool_choice"] = "auto"
 	ensureZenEnvMarkerResponses(body)
 	return body
