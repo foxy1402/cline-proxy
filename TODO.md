@@ -1,36 +1,5 @@
 # TODO — Public container deployment: stateless /v1 proxy with multi-account rotation
 
-## zen system-prompt relocation: system role gets a fixed short prompt (2026-11-07)
-
-Operator directive: the client's (IDE's) system prompt should not sit in the
-system role of the zen upstream request. The model still receives the full
-client instructions, but via the **first user message**, wrapped in
-`<system>…</system>` at the head; the system role carries a short fixed
-prompt ("You are a helpful coding assistant.") with the `<env>` gate block
-appended as before.
-
-Implementation (both upstream paths, shared toggle):
-- `relocateZenSystemPrompt` (chat, in `buildZenBody` before the env-marker
-  step): all system/developer message text is joined, moved into the first
-  user message (string or parts-array content both handled), and the
-  system/developer messages are replaced by one fixed-prompt system message.
-  Copy-before-mutate, same discipline as the env-marker step — the client's
-  `params` are never polluted, so endpoint-learner retries, logs and token
-  estimates see the original shape. No user message → nothing to relocate,
-  client system is kept as-is.
-- `relocateZenSystemPromptResponses` (responses path): the client system text
-  (already merged into `instructions`) moves to the first user `input` entry,
-  `instructions` becomes the fixed prompt; the env marker is appended to it.
-- Toggle `systemRelocation` in the zen config (panel: "Relocate system prompt
-  to user message"), **default on**; `nil` in an old config file means on,
-  same idiom as `pinProxyPerKey`.
-
-Tests: `zen_system_relocation_test.go` (string/parts content, merged
-system+developer, no-user-message, empty system, disabled toggle, no-system
-unchanged, deterministic byte-stable rebuild, responses path). The pre-existing
-env-marker tests are isolated with the toggle off so they keep asserting
-marker-only behaviour.
-
 ## zen daily quota exhaustion: park the key, do not retry it (2026-10-31)
 
 Yesterday's fix capped the key cooldown at 20 minutes because `Retry-After`
