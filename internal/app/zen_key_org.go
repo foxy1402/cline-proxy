@@ -18,37 +18,48 @@ import (
 
 // ============ zen 每 key 组织 ID（x-opencode-org-id）============
 //
-// 背景（2026-11-11 桌面端 2.2.7 抓包 + 二进制静态分析）：
+// 2026-11-11 实测（活动 key oc_sk_9d87…，直接打 inference 端点）：
 //
-//	真实 opencode 客户端在 chat 请求上发 x-opencode-org-id: wrk_01M2...
-//	该值**不是**全局常量——同机实测确认每个 key 对应各自的 org：
-//	  每个 OpenCode Console 账号/服务账号的 key 绑定一个 org（wrk_/org_ 前缀）。
+//	无该头                 -> 429 FreeUsageLimitError（正常限流，说明 key 有效）
+//	x-opencode-org-id: <别的账号的 wrk_…>  -> 403 permission_error
+//	                                          "Workspace access denied"
+//	x-opencode-org-id: 非 wrk_/org_ 前缀的串 -> 400
 //
-// 官方客户端怎么拿到它（opencode-cli.exe 静态分析结论）：
-//   - OAuth 连接：登录时 /auth/device/token 返回 org_id，写进 credential.metadata.orgID；
-//     未带 org 时遍历 /api/orgs 取第一个。
-//   - 「API key (service account)」连接：credential 是 {type:"key", key}，**metadata 为空**。
-//     此时客户端不发该头——本机 opencode.db 的 credential 行正是这种形态
-//     （type=key、无 metadata），而抓包里出现了 org 头，说明那一次抓包用的是
-//     带 metadata 的凭据形态（或运行期另有来源）。
+// 结论（三条，都直接决定实现）：
+//  1. 该头**会被上游强制校验**，且必须与 key 所属的 workspace 一致。发错 org
+//     不是"轻微不像客户端"，而是把一次本来能过的请求变成硬 403。
+//  2. 因此**发一个猜的/借的 org 严格劣于不发**。任何时候拿不到某把 key 自己的
+//     org，唯一正确做法就是省略该头——这也是官方客户端在 service-account key
+//     上的行为（credential 为 {type:"key", key}、metadata 为空，见下）。
+//  3. 全局单一 org 值在多 key 池里必然出错：只要有两把分属不同 workspace 的 key，
+//     其中一把必定被 403。故 cfg.OrgID 绝不能当"默认值"套给所有 key。
 //
-// 网关的正确做法（本文件的实现）：
+// 官方客户端怎么拿到该值（opencode-cli.exe 静态分析）：
+//   - OAuth 连接：登录时 /auth/device/token 返回 org_id，写入 credential.metadata.orgID；
+//     未返回 org 时遍历 /api/orgs 取第一个。
+//   - 「API key (service account)」连接：credential 只有 {type:"key", key}，metadata 为空。
+//     注入点 `a.metadata?.orgID` 取不到值，**不发该头**。
+//   - 本机 opencode.db 的 credential 行正是第二种形态（无 metadata），即 CLI 常态下
+//     根本不会发这个头；先前抓包里的 org 来自带 metadata 的 OAuth/其它凭据形态。
 //
-//	org id 必须**按 key**解析，绝不能用一个全局常量套到所有 key 上——那样
-//	跨 key 互换 org 会让上游看到"key 属于 A org、请求声称 B org"的矛盾形态。
-//	故本文件维护 key -> orgID 的映射，并为每个 key 单独尝试发现。
+// 发现端点是否可用（2026-11-11 用活动 key 逐条验证）：
 //
-// 发现端点（与官方客户端同源，见二进制分析）：
+//	GET /console/api/orgs       -> 401 {"_tag":"Unauthorized"}
+//	GET /console/api/user       -> 401
+//	GET /console/api/v2/config  -> 200（说明这把 key 本身对 console 是有效的）
+//	GET /api/orgs, /api/user    -> 404
+//	/console/api/v2/* 其它路径  -> 404
 //
-//	GET https://opencode.ai/console/api/orgs   Authorization: Bearer <key>
-//	  200 -> [{"id":"wrk_...","name":"..."}, ...]
-//	非 200（401 ApiKeyExpired / 403 / 404）-> 无结论，保持未解析。
+// 即：console 的 orgs 端点**不接受 service-account API key**（它要 OAuth 会话）。
+// 对 oc_sk_ 这类 key 没有可用的 org 发现途径，网关也就不该去猜。
 //
-// 失败与未知一律**省略该头**：缺一个可选头是安全的（客户端在 service-account
-// key 上本来就不发），而发错 org 是主动制造矛盾。绝不编造。
+// 本文件因此承担两件事：
+//  1. 按 key 解析（有就把该 key 自己的 org 发出去，绝不跨 key 借用）；
+//  2. 解析不到就省略该头（默认路径），并对失败做负缓存，避免每次请求都白探一次。
 //
-// 与 cfg.OrgID 的关系：手动配置的全局值仍是显式覆盖（管理员知道自己在做什么），
-// 但仅在发现不到该 key 自己的 org 时兜底使用，且按 key 记为"回退"以便排障。
+// 自我保护（2026-11-11 追加）：曾把 cfg.OrgID 当全局默认值套给所有 key。在
+// "该头会被校验"的事实下这是致命的——一个配错的值会让整池请求 403。现改为
+// **默认完全不用该全局值**（见 zenKeyOrgForRequest 的 allowFallback 参数）。
 
 // zenOrgFile 每 key org 缓存的持久化路径。
 func zenOrgFile() string {
@@ -145,6 +156,13 @@ func saveZenOrgLocked() {
 // 单飞 + 负缓存保证每个 key 最多一次往返，且失败后 6 小时内不再重试。
 func zenKeyOrg(key string) string {
 	if key == "" {
+		return ""
+	}
+	// service-account key 已知无法发现（2026-11-11 实测：console/api/orgs 对
+	// oc_sk_ 恒 401，而同一把 key 对 console/api/v2/config 是 200）。直接返回，
+	// 省掉首次请求的一次注定失败的往返。若将来 console 支持了这类 key，把这里
+	// 的分支去掉即可恢复探测。
+	if strings.HasPrefix(key, "oc_sk_") {
 		return ""
 	}
 	zenOrgMu.Lock()
@@ -273,8 +291,14 @@ func zenKeyOrgForRequest(key string) (org string, source string) {
 	if org := zenKeyOrg(key); org != "" {
 		return org, "discovered"
 	}
+	// 解析不到就用管理员显式配置的兜底——但仅在**唯一 key** 时。
+	//
+	// 理由：该头会被上游按 workspace 校验（错发 = 硬 403）。单 key 部署里
+	// 管理员填的值只能是这把 key 的 org，是安全的显式覆盖；多 key 部署里
+	// 同一个值必然与其中一部分 key 不匹配，套上去等于主动制造 403。
+	// 所以多 key 时宁可不发（缺头是合法的，官方客户端常态就不发）。
 	if cfg := getZenConfig(); cfg != nil {
-		if g := strings.TrimSpace(cfg.OrgID); g != "" {
+		if g := strings.TrimSpace(cfg.OrgID); g != "" && len(cfg.Keys) <= 1 {
 			return g, "config-fallback"
 		}
 	}
@@ -301,8 +325,8 @@ func zenKeyOrgMap(keys []string) []zenKeyOrgInfo {
 			out[i] = zenKeyOrgInfo{OrgID: org, Source: "discovered"}
 			continue
 		}
-		// 未发现：若配置了全局兜底，请求路径会用该值，面板如实显示。
-		if fallback != "" && k != "public" {
+		// 未发现：仅单 key 部署时才回退到配置值（多 key 下不发，见 zenKeyOrgForRequest）。
+		if fallback != "" && k != "public" && len(keys) <= 1 {
 			out[i] = zenKeyOrgInfo{OrgID: fallback, Source: "config-fallback"}
 		}
 	}

@@ -35,12 +35,15 @@ func resetZenOrgState(t *testing.T) {
 	})
 }
 
-// setZenOrgConfigFallback 设置全局兜底 org（cfg.OrgID），返回还原函数。
-func setZenOrgConfigFallback(t *testing.T, org string) {
+// setZenOrgConfigFallback 设置全局兜底 org（cfg.OrgID）与 key 池，测试结束还原。
+func setZenOrgConfigFallback(t *testing.T, org string, keys ...string) {
 	t.Helper()
 	prev := *getZenConfig()
 	next := prev
 	next.OrgID = org
+	if len(keys) > 0 {
+		next.Keys = keys
+	}
 	setZenConfig(&next)
 	t.Cleanup(func() { restore := prev; setZenConfig(&restore) })
 }
@@ -149,22 +152,49 @@ func TestZenKeyOrgUnresolvedOmitted(t *testing.T) {
 	}
 }
 
-// 全局 cfg.OrgID 只做兜底：key 自己的解析结果优先。
-func TestZenKeyOrgDiscoveredBeatsConfigFallback(t *testing.T) {
+// 全局 cfg.OrgID 只在**单 key** 部署里兜底；多 key 时绝不套用。
+//
+// 依据（2026-11-11 实测）：该头被上游按 workspace 校验，发错直接 403
+// "Workspace access denied"。单 key 下管理员填的值只可能是这把 key 的 org，
+// 安全；多 key 下同一个值必然与部分 key 不匹配，套上去就是自伤。
+func TestZenKeyOrgFallbackOnlyForSingleKeyPool(t *testing.T) {
 	resetZenOrgState(t)
 	newFakeZenOrgServer(t, map[string][]map[string]string{
 		"key-alpha": {{"id": "wrk_ALPHA", "name": "Alpha"}},
 	})
 
-	setZenOrgConfigFallback(t, "wrk_CONFIG")
-
-	// 能解析的 key：用自己的，不用配置值。
+	// 能解析的 key：永远用自己的值，与 key 数量无关。
+	setZenOrgConfigFallback(t, "wrk_CONFIG", "key-alpha")
 	if org, src := zenKeyOrgForRequest("key-alpha"); org != "wrk_ALPHA" || src != "discovered" {
 		t.Errorf("key-alpha -> (%q,%q), want (wrk_ALPHA, discovered)", org, src)
 	}
-	// 解析不到的 key：回退到配置值，并标明来源。
+
+	// 单 key 池 + 该 key 解析不到 -> 回退到配置值。
 	if org, src := zenKeyOrgForRequest("unknown-key"); org != "wrk_CONFIG" || src != "config-fallback" {
-		t.Errorf("unknown-key -> (%q,%q), want (wrk_CONFIG, config-fallback)", org, src)
+		t.Errorf("single-key fallback -> (%q,%q), want (wrk_CONFIG, config-fallback)", org, src)
+	}
+
+	// 多 key 池 -> 解析不到就不发（不能把某把 key 的 org 套给其它 key）。
+	setZenOrgConfigFallback(t, "wrk_CONFIG", "key-alpha", "key-beta")
+	if org, src := zenKeyOrgForRequest("unknown-key"); org != "" || src != "" {
+		t.Errorf("multi-key pool -> (%q,%q), want no org (header must be omitted)", org, src)
+	}
+}
+
+// oc_sk_ 这类 key 已知无法发现（console 对它们恒 401），必须直接跳过探测，
+// 不能为它白花一次请求路径上的往返。
+func TestZenKeyOrgSkipsProbeForServiceAccountKey(t *testing.T) {
+	resetZenOrgState(t)
+	f := newFakeZenOrgServer(t, map[string][]map[string]string{
+		"oc_sk_test_key": {{"id": "wrk_SHOULD_NOT_BE_USED", "name": "X"}},
+	})
+	if org := zenKeyOrg("oc_sk_test_key"); org != "" {
+		t.Errorf("org = %q, want empty (service-account keys cannot be resolved)", org)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.calls["oc_sk_test_key"] != 0 {
+		t.Errorf("probed %d times, want 0 (must skip known-unsupported key class)", f.calls["oc_sk_test_key"])
 	}
 }
 
@@ -225,7 +255,7 @@ func TestSetZenGateHeadersNoKeyOmitsOrg(t *testing.T) {
 		t.Errorf("x-opencode-org-id = %q with no key and no config, want absent", v)
 	}
 
-	setZenOrgConfigFallback(t, "wrk_EXPLICIT")
+	setZenOrgConfigFallback(t, "wrk_EXPLICIT", "only-key")
 	req2, _ := http.NewRequest("POST", "https://opencode.ai/inference/openai/v1/chat/completions", nil)
 	setZenGateHeaders(req2, "ses_x", "msg_x", "")
 	if v := headerOrg(req2); v != "wrk_EXPLICIT" {
@@ -249,23 +279,48 @@ func headerOrg(req *http.Request) string {
 func TestZenKeyOrgPersistHasNoRawKey(t *testing.T) {
 	resetZenOrgState(t)
 	newFakeZenOrgServer(t, map[string][]map[string]string{
-		"oc_sk_super_secret_value": {{"id": "wrk_SECRET_ORG", "name": "S"}},
+		"sk-live-super-secret-value": {{"id": "wrk_SECRET_ORG", "name": "S"}},
 	})
-	if org := zenKeyOrg("oc_sk_super_secret_value"); org != "wrk_SECRET_ORG" {
+	if org := zenKeyOrg("sk-live-super-secret-value"); org != "wrk_SECRET_ORG" {
 		t.Fatalf("org = %q", org)
 	}
-	// 触发一次失败记录，确保 failed 表也走哈希。
-	_ = zenKeyOrg("oc_sk_another_secret")
+	// 触发一次失败记录，确保 failed 表也走哈希（负缓存路径）。
+	_ = zenKeyOrg("sk-live-another-secret")
 
 	data, err := os.ReadFile(zenOrgFile())
 	if err != nil {
 		t.Fatalf("read cache file: %v", err)
 	}
-	if strings.Contains(string(data), "oc_sk_") {
+	if strings.Contains(string(data), "sk-live-") {
 		t.Errorf("cache file leaks a raw key: %s", data)
 	}
 	// 但 org 本身要能恢复出来（重启后不用再探测）。
 	if !strings.Contains(string(data), "wrk_SECRET_ORG") {
 		t.Errorf("cache file lost the resolved org: %s", data)
+	}
+}
+
+// 回归护栏（2026-11-11 实测）：发错 org 会让上游回 403 "Workspace access denied"。
+// 因此多 key 池里，任何一把解析不到 org 的 key 都必须**不带**该头，绝不能借用
+// 别的 key 的 org 或某个全局值——那会把可成功的请求变成硬失败。
+func TestZenGateHeadersNeverSendsBorrowedOrgInMultiKeyPool(t *testing.T) {
+	resetZenOrgState(t)
+	newFakeZenOrgServer(t, map[string][]map[string]string{
+		"key-alpha": {{"id": "wrk_ALPHA", "name": "Alpha"}},
+		"key-beta":  {{"id": "wrk_BETA", "name": "Beta"}},
+	})
+	setZenOrgConfigFallback(t, "wrk_CONFIG", "key-alpha", "key-beta", "key-expired")
+
+	cases := map[string]string{
+		"key-alpha":   "wrk_ALPHA",
+		"key-beta":    "wrk_BETA",
+		"key-expired": "", // 解析不到 + 多 key => 必须省略
+	}
+	for key, want := range cases {
+		req, _ := http.NewRequest("POST", "https://opencode.ai/inference/openai/v1/chat/completions", nil)
+		setZenGateHeaders(req, "ses_x", "msg_x", key)
+		if got := headerOrg(req); got != want {
+			t.Errorf("key %q -> x-opencode-org-id %q, want %q", key, got, want)
+		}
 	}
 }

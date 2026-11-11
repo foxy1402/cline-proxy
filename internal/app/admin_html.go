@@ -566,8 +566,8 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <select id="ocProbeModel" style="max-width:300px"><option value="">auto — big-pickle first, then live models</option></select>
       <label class="hint" style="margin:0 0 0 6px">Session rotation (min):</label>
       <input type="text" id="ocSessionRotate" placeholder="120" style="max-width:90px" title="Legacy: sticky-session rotation interval. Sessions are minted per API call since 2026-10-27, so the rotator is disabled and this value is inert.">
-      <label class="hint" style="margin:0 0 0 6px">Org ID fallback:</label>
-      <input type="text" id="ocOrgID" placeholder="empty = per-key only" style="max-width:220px" title="Fallback org id for x-opencode-org-id. Each key's own org id is discovered automatically from console/api/orgs; this value is only used when discovery fails for that key. Leave empty to omit the header in that case. There is no single global org id — never put one key's org here and apply it to all keys.">
+      <label class="hint" style="margin:0 0 0 6px">Org ID (single key only):</label>
+      <input type="text" id="ocOrgID" placeholder="usually empty" style="max-width:220px" title="x-opencode-org-id. Upstream validates this against the key's workspace: a wrong value returns 403 &quot;Workspace access denied&quot;, so sending nothing is always safe and is what the official client does for API keys. This field is only used when the pool has exactly ONE key and that key's org cannot be discovered; with two or more keys it is ignored entirely, because one value cannot match every key. Leave it empty unless you have a single key and know its exact org id.">
     </div>
     <p class="hint" style="margin-top:0">Session IDs are minted locally, one per API call, and match the upstream's format gate (<code>^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$</code>) — no CLI or harvester involved. The sticky-session table below is informational only; upstream calls no longer reuse a session across requests.</p>
     <div class="form-row">
