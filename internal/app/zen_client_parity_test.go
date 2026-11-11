@@ -93,7 +93,7 @@ func TestSetZenGateHeadersB3HasParentSpan(t *testing.T) {
 	}
 	setZenGateHeaders(req, "ses_aabbccddeeff0123456789ABCD", "msg_x", "")
 
-	b3 := req.Header.Get("b3")
+	b3 := headerTrace(req, "b3")
 	if b3 == "" {
 		t.Fatal("b3 header missing")
 	}
@@ -115,10 +115,20 @@ func TestSetZenGateHeadersB3HasParentSpan(t *testing.T) {
 	}
 
 	// traceparent 仍只含 trace/span（W3C 格式，与 b3 共享同一 trace/span）。
-	tp := req.Header.Get("traceparent")
+	tp := headerTrace(req, "traceparent")
 	if !strings.Contains(tp, parts[0]) || !strings.Contains(tp, parts[1]) {
 		t.Errorf("traceparent %q must share trace/span with b3 %q", tp, b3)
 	}
+}
+
+// headerTrace 读取小写键名写入的 b3/traceparent。
+// 与 headerOrg 同理：Header.Get 按规范形式（B3/Traceparent）查找，读不到
+// 刻意用 map 直写的小写头名。
+func headerTrace(req *http.Request, name string) string {
+	if v := req.Header[name]; len(v) > 0 {
+		return v[0]
+	}
+	return ""
 }
 
 // UA 必须与抓包来源版本一致（桌面端 2.2.7）。
@@ -133,5 +143,108 @@ func TestZenUserAgentMatchesCapturedClient(t *testing.T) {
 	req.Header.Set("User-Agent", zenNativeUA)
 	if got := req.Header.Get("User-Agent"); got != "opencode/latest/2.2.7/cli" {
 		t.Errorf("User-Agent = %q", got)
+	}
+}
+
+// 2026-11-11 Android 客户端 2.2.7 抓包（未登录、真实 inference 请求）。
+//
+// 这是第一次拿到**匿名**官方客户端的完整线上请求，因此它的形态是"无凭据
+// 客户端到底长什么样"的唯一权威依据。三处与桌面端抓包一致的细节在下面锁定：
+// 小写 b3/traceparent、显式 Connection: keep-alive、Authorization: Bearer public。
+func TestSetZenGateHeadersLowerCaseTracing(t *testing.T) {
+	req, err := http.NewRequest("POST", "https://opencode.ai/inference/openai/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setZenGateHeaders(req, "ses_aabbccddeeff0123456789ABCD", "msg_x", "public")
+
+	// 直接读 map（小写键）：Header.Get 会按规范形式查找，识别不了这种写法。
+	for _, name := range []string{"b3", "traceparent"} {
+		if len(req.Header[name]) == 0 {
+			t.Errorf("header %q missing; the real client sends it lowercased", name)
+		}
+		// 规范形式绝不能被写进去（否则线上字节与真实客户端不同）。
+		canon := http.CanonicalHeaderKey(name)
+		if canon != name && len(req.Header[canon]) != 0 {
+			t.Errorf("header written as %q, want lowercase %q", canon, name)
+		}
+	}
+}
+
+// 真实客户端显式发 Connection: keep-alive；Go 的 Transport 在持久连接时
+// 默认省略该头，故必须显式设置才与抓包一致。
+func TestSetZenGateHeadersSendsConnectionKeepAlive(t *testing.T) {
+	req, err := http.NewRequest("POST", "https://opencode.ai/inference/openai/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setZenGateHeaders(req, "ses_aabbccddeeff0123456789ABCD", "msg_x", "public")
+	if got := req.Header.Get("Connection"); got != "keep-alive" {
+		t.Errorf("Connection = %q, want keep-alive (captured client sends it explicitly)", got)
+	}
+}
+
+// gate 工具定义必须与 2.2.7 抓包字节一致：12 个工具、同一顺序、同一描述与
+// parameters。zen_gate_tools.json 就是"官方工具集"的唯一副本，抓包里多出来的
+// 空格都算偏差——若上游日后拿描述做校验，这里是最先会坏的地方。
+func TestZenGateToolsMatchCapturedClient(t *testing.T) {
+	defs := zenGateToolDefs()
+	if len(defs) != 12 {
+		t.Fatalf("gate tools = %d, want 12", len(defs))
+	}
+	want := []string{
+		"edit", "glob", "grep", "question", "read", "shell",
+		"skill", "subagent", "webfetch", "websearch", "write", "execute",
+	}
+	for i, name := range want {
+		if i >= len(defs) {
+			t.Fatalf("missing tool %d %q", i, name)
+		}
+		if defs[i].Name != name {
+			t.Errorf("tool[%d] = %q, want %q (order must match the client)", i, defs[i].Name, name)
+		}
+		if defs[i].Description == "" {
+			t.Errorf("tool %q has empty description", name)
+		}
+		if len(defs[i].ParametersChat) == 0 {
+			t.Errorf("tool %q has empty parameters_chat (empty schema gets 403)", name)
+		}
+		if len(defs[i].ParametersResponses) == 0 {
+			t.Errorf("tool %q has empty parameters_responses", name)
+		}
+	}
+}
+
+// shell 的描述在 2.2.7 里写的是 sh（Android/CLI 2.2.7 实测），不是 bash。
+// 这条断言存在的意义是防止有人"顺手改回 bash"。
+func TestZenGateShellToolUsesSh(t *testing.T) {
+	for _, d := range zenGateToolDefs() {
+		if d.Name != "shell" {
+			continue
+		}
+		if !strings.Contains(d.Description, "using sh") {
+			t.Errorf("shell description must say \"using sh\" (2.2.7 capture); got %q", d.Description)
+		}
+		if strings.Contains(d.Description, "using bash") {
+			t.Error("shell description still says bash; 2.2.7 capture says sh")
+		}
+		return
+	}
+	t.Fatal("shell gate tool not found")
+}
+
+// 匿名哨兵 "public" 不是真凭据，绝不能触发 console/api/orgs 探测。
+func TestZenKeyOrgSkipsPublicSentinel(t *testing.T) {
+	resetZenOrgState(t)
+	f := newFakeZenOrgServer(t, map[string][]map[string]string{
+		"public": {{"id": "wrk_SHOULD_NOT_BE_USED", "name": "X"}},
+	})
+	if org := zenKeyOrg("public"); org != "" {
+		t.Errorf("org = %q for anonymous sentinel, want empty", org)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.calls["public"] != 0 {
+		t.Errorf("probed %d times for \"public\", want 0 (not a credential)", f.calls["public"])
 	}
 }

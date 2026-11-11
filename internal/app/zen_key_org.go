@@ -165,6 +165,12 @@ func zenKeyOrg(key string) string {
 	if strings.HasPrefix(key, "oc_sk_") {
 		return ""
 	}
+	// 匿名哨兵 "public" 不是真实凭据（没有 key 可关联，也就没有 org）。
+	// 不特判的话它每次冷启动都会去打一次 console/api/orgs，拿 401 后写负缓存
+	// ——纯粹的无效上游往返，还是用假凭据。见 egress.go 对 "public" 的处理。
+	if key == "public" {
+		return ""
+	}
 	zenOrgMu.Lock()
 	loadZenOrgOnce()
 	if org, ok := zenOrgData.Orgs[zenKeyID(key)]; ok {

@@ -1913,6 +1913,11 @@ func setZenGateHeaders(req *http.Request, sess, requestID, key string) {
 	// practice, and the gateway parses SSE as raw bytes, so this is safe.
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	// Connection: keep-alive。2026-11-11 Android 客户端 2.2.7 抓包（匿名真实
+	// inference 请求）确认官方客户端显式发这个头；Go 的 Transport 在正常
+	// keep-alive 时**省略**它（HTTP/1.1 默认即持久连接）。语义完全等价，纯粹
+	// 是头集合形态对齐。
+	req.Header.Set("Connection", "keep-alive")
 	// CLI v2 tracing headers, same trace/span across b3 and traceparent.
 	//
 	// b3 是 4 段（traceid-spanid-sampled-parentSpanId）。2026-11-11 桌面端
@@ -1921,11 +1926,17 @@ func setZenGateHeaders(req *http.Request, sess, requestID, key string) {
 	// 而网关此前只发 3 段（省略 parentSpanId）。B3 规范里 parentSpanId 是
 	// 可选的，但官方客户端总是带上——网关是整条链路的最上游，没有真实父
 	// span，故随机生成一个：字段形态正确，且不虚构任何真实调用关系。
+	//
+	// 头名用小写：2026-11-11 Android 客户端 2.2.7 抓包（未登录、真实
+	// inference 请求）确认官方客户端发的是小写 `b3` / `traceparent`。Header.Set
+	// 会把名字规范化成 `B3` / `Traceparent`，字节层面与真实客户端不同。HTTP
+	// 头本就不区分大小写，但本函数其余身份头（x-opencode-*）都刻意用 map 直写
+	// 保持小写，这里若用 Set 就自相矛盾了。
 	traceID := kit.RandHex(16)
 	spanID := kit.RandHex(8)
 	parentSpanID := kit.RandHex(8)
-	req.Header.Set("b3", traceID+"-"+spanID+"-1-"+parentSpanID)
-	req.Header.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
+	req.Header["b3"] = []string{traceID + "-" + spanID + "-1-" + parentSpanID}
+	req.Header["traceparent"] = []string{"00-" + traceID + "-" + spanID + "-01"}
 }
 
 // zenClientFlatTools 提取客户端工具并转成 responses 端点要求的 flat 形态。
