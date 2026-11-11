@@ -261,7 +261,7 @@ func TestZenHeadersOnTheWire(t *testing.T) {
 	want := map[string]string{
 		"X-Opencode-Client":  "cli",
 		"X-Opencode-Project": "global",
-		"User-Agent":         "opencode/latest/2.1.4/cli",
+		"User-Agent":         "opencode/latest/2.2.7/cli",
 	}
 	for k, v := range want {
 		if g := h.Get(k); g != v {

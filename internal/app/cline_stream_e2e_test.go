@@ -402,9 +402,9 @@ func TestClineHeadersContract(t *testing.T) {
 }
 
 // zen 上游身份头与 UA 必须与 audit 规格一致：UA 为 CLI v2 的
-// "opencode/latest/2.1.4/cli"（2026-10-26 实测）；gate 头用官方的小写键名。
+// "opencode/latest/2.2.7/cli"（2026-11-11 桌面端 2.2.7 抓包）；gate 头用官方的小写键名。
 func TestZenHeadersMatchAuditSpec(t *testing.T) {
-	if zenNativeUA != "opencode/latest/2.1.4/cli" {
+	if zenNativeUA != "opencode/latest/2.2.7/cli" {
 		t.Errorf("zenNativeUA drifted from the audit spec: %q", zenNativeUA)
 	}
 	// 轮换列表里的原生 UA 条目也必须是同一版本

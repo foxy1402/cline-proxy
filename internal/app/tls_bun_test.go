@@ -68,7 +68,7 @@ func TestBunSpecMatchesCLIV2(t *testing.T) {
 			t.Fatalf("gate tool %q has no chat parameters", n)
 		}
 	}
-	if zenNativeUA != "opencode/latest/2.1.4/cli" {
+	if zenNativeUA != "opencode/latest/2.2.7/cli" {
 		t.Fatalf("zenNativeUA = %q, want CLI v2 UA", zenNativeUA)
 	}
 }

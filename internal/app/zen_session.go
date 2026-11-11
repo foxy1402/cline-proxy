@@ -62,10 +62,16 @@ var (
 	// 销毁可能有价值的数据（重启后重试读取）。
 	zenSessSaveBlocked bool
 	// zenNativeUA 官方 CLI v2 的 UA（会话粘性与轮换列表共用）。
-	// 2026-10-26 实测：CLI v2.1.4 在 chat 与 responses 两条路径都发
-	// opencode/latest/2.1.4/cli；旧 ai-sdk 形态 UA（1.18.35）已不再是
+	// 2026-10-26 实测：CLI v2 在 chat 与 responses 两条路径都发
+	// opencode/latest/<版本>/cli；旧 ai-sdk 形态 UA（1.18.35）已不再是
 	// 官方客户端的 UA，与 v2 TLS 指纹组合时会被上游识别为旧客户端。
-	zenNativeUA = "opencode/latest/2.1.4/cli"
+	//
+	// 2026-11-11 升到 2.2.7 —— 桌面端（Electron UI + opencode-cli.exe 边车）
+	// 捆绑的运行时版本，也是本机实际在跑、本次抓包的来源版本。安全性依据：
+	// 两个二进制的 Bun 版本完全相同（v1.4.4 / 38afee6c8，strings 逐字核对），
+	// 所以 2.2.7 与既有 Bun TLS 指纹（tls_bun.go 采集自 2.1.4）不冲突。
+	// npm 全局 CLI 仍是 2.1.4，两者只差版本号。
+	zenNativeUA = "opencode/latest/2.2.7/cli"
 )
 
 // defaultSessionRotateMinutes 粘性会话的默认轮换周期（分钟）。语义见

@@ -1404,8 +1404,20 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 			}
 		}
 	}
-	delete(body, "reasoning_effort")
-	delete(body, "reasoningEffort")
+	// reasoning_effort：2026-11-11 桌面端 2.2.7 实测抓包推翻了此前"客户端
+	// 不发该字段"的结论。真实行为是"按模型能力决定"：
+	//   - deepseek-v4.1-flash-free（目录 capabilities.reasoning.effort =
+	//     ["low","high","max"]）→ 客户端发 reasoning_effort:"high"。
+	//   - big-pickle（capabilities.reasoning 只有 supported，无 effort）→
+	//     客户端完全不发。
+	// 也就是说 effort 由客户端的模型变体选择决定，不是网关该猜的东西。
+	// 故这里改为纯透传：客户端给就原样转发（驼峰统一成下划线），不给就
+	// 绝不补默认值——凭空造一个 "high" 反而会让非 reasoning 模型收到非法字段。
+	if eff, ok := params["reasoning_effort"]; ok && eff != nil {
+		body["reasoning_effort"] = eff
+	} else if eff, ok := params["reasoningEffort"]; ok && eff != nil {
+		body["reasoning_effort"] = eff
+	}
 	// FreeTier gate（2026-09-18 实测解码）：zen 免费层 chat 端点校验请求体
 	// 是否携带 opencode 工具集，缺失则 403（"can only be used from within
 	// OpenCode"）。恒注入 12 个 v2 规范工具名保证过闸。
@@ -1434,14 +1446,22 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 	//    此时 tools[] 里只有 gate 占位 stub，客户端没有执行层；让上游按
 	//    auto/required 处理会让模型返回 read/shell/execute 这类客户端从未
 	//    声明的调用，IDE 解析失败（required 更会强制成一次必失败的工具调用）。
-	//  - 客户端有工具但没指定：auto，让模型按需调用客户端真实工具。
-	//  - 客户端显式指定且有工具：原样透传。
+	//    这是**故意**偏离官方客户端的唯一一处：官方客户端永远带着自己真实的
+	//    工具集，不存在"有 gate stub 但无执行层"的状态，所以它可以直接省略。
+	//  - 客户端有工具但没指定：省略该字段。2026-11-11 桌面端 2.2.7 抓包证实
+	//    官方客户端在 chat 路径不发 tool_choice（上游缺省即 auto）。此前网关
+	//    补 "auto" 是多余字段——语义相同，但形态与真实客户端不同。
+	//  - 客户端显式指定且有工具：原样透传。旧版 function_call 语义等价于
+	//    tool_choice，转换 tools[] 后同样透传（否则老客户端的 "required"
+	//    会在转换中丢失）。
 	if len(clientTools) == 0 {
 		body["tool_choice"] = "none"
 	} else if tc, ok := params["tool_choice"]; ok {
 		body["tool_choice"] = tc
+	} else if tc, ok := params["function_call"]; ok {
+		body["tool_choice"] = tc
 	} else {
-		body["tool_choice"] = "auto"
+		delete(body, "tool_choice")
 	}
 	ensureZenEnvMarkerChat(body)
 	return body
@@ -1875,9 +1895,17 @@ func setZenGateHeaders(req *http.Request, sess, requestID string) {
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 	// CLI v2 tracing headers, same trace/span across b3 and traceparent.
+	//
+	// b3 是 4 段（traceid-spanid-sampled-parentSpanId）。2026-11-11 桌面端
+	// 2.2.7 抓包逐字确认：真实客户端发的是
+	//   b3: <32hex>-<16hex>-1-<16hex>
+	// 而网关此前只发 3 段（省略 parentSpanId）。B3 规范里 parentSpanId 是
+	// 可选的，但官方客户端总是带上——网关是整条链路的最上游，没有真实父
+	// span，故随机生成一个：字段形态正确，且不虚构任何真实调用关系。
 	traceID := kit.RandHex(16)
 	spanID := kit.RandHex(8)
-	req.Header.Set("b3", traceID+"-"+spanID+"-1")
+	parentSpanID := kit.RandHex(8)
+	req.Header.Set("b3", traceID+"-"+spanID+"-1-"+parentSpanID)
 	req.Header.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
 }
 

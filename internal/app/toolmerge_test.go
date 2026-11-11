@@ -79,7 +79,8 @@ func TestBuildZenBodyToolChoicePolicy(t *testing.T) {
 	if body["tool_choice"] != "none" {
 		t.Errorf("tool_choice = %v, want none when client sent no tools (gate stubs are not callable)", body["tool_choice"])
 	}
-	// 客户端带工具但未指定：auto，让模型按需调用客户端真实工具
+	// 客户端带工具但未指定：省略该字段（官方客户端 2.2.7 就是这样，上游
+	// 缺省即 auto）。补 "auto" 语义等价，但形态与真实客户端不同。
 	body = buildZenBody(map[string]any{
 		"model":    "ling-2.6-flash",
 		"messages": []any{},
@@ -87,8 +88,8 @@ func TestBuildZenBodyToolChoicePolicy(t *testing.T) {
 			"name": "get_weather", "parameters": map[string]any{"type": "object"},
 		}}},
 	}, false)
-	if body["tool_choice"] != "auto" {
-		t.Errorf("tool_choice = %v, want auto when client sent tools but no preference", body["tool_choice"])
+	if v, has := body["tool_choice"]; has {
+		t.Errorf("tool_choice = %v, want the key omitted when client sent tools but no preference", v)
 	}
 	tools, _ = body["tools"].([]any)
 	if len(tools) != len(zenGateToolSpecs)+1 {
