@@ -1214,6 +1214,8 @@ func zenKeyStatus() []map[string]any {
 	}
 	// 出口绑定同样先快照：egress 路径取 zenConfigMu/egressMu，不能与 zenKeyMu 嵌套。
 	egress := zenEgressSnapshotOf(keys)
+	// 每 key 组织 ID 也先快照（zenOrgMu），同样不与 zenKeyMu 嵌套。
+	orgs := zenKeyOrgMap(keys)
 	zenKeyMu.Lock()
 	defer zenKeyMu.Unlock()
 	now := time.Now()
@@ -1244,6 +1246,12 @@ func zenKeyStatus() []map[string]any {
 		} else if e.bound {
 			st["proxy"] = ""
 			st["noEgress"] = true
+		}
+		// 每 key 组织 ID（x-opencode-org-id 的来源）。空 = 未解析（该头省略）。
+		// 面板必须能看出来，否则"为什么这个 key 的请求不带 org 头"无从判断。
+		if o := orgs[i]; o.OrgID != "" {
+			st["orgID"] = o.OrgID
+			st["orgSource"] = o.Source
 		}
 		if until, cooling := zenKeyCool[k]; cooling && now.Before(until) {
 			st["cooling"] = true
@@ -1869,13 +1877,19 @@ func buildZenResponsesBody(params map[string]any, modelID string, promptKey stri
 //     x-session-affinity, x-session-id，四个头同值（新鲜会话时四者
 //     相等；父会话/分支会话时 q 规则见静态 RE 报告，网关粘性会话
 //     属于新鲜会话情形，故四者同值正确）。
-//   - CLI v2 完全不发 x-opencode-request（静态计数 0，抓包亦无）。
-//     旧网关仍发该头是 v1 遗留指纹，必须去掉；requestID 参数保留
-//     仅为调用点兼容，不再写入任何头。
-//   - x-opencode-org-id 只在 OAuth 账户元数据有 orgID 时出现，网关
-//     的原始 key 字符串中没有该信息，绝不编造，缺省即正确。
+//   - x-opencode-request：v2 CLI 完全不发（静态计数 0，抓包亦无）。旧网关仍发该头
+//     是 v1 遗留指纹，必须去掉；requestID 参数保留仅为调用点兼容，不再写入任何头。
+//   - x-opencode-org-id：**按 key 解析**，绝不能是全局常量。2026-11-11 实测确认
+//     每个 zen key 绑定各自的 org（wrk_/org_ 前缀），跨 key 套用同一值会让上游
+//     看到"key 属于 A org、请求声称 B org"的矛盾形态。解析逻辑见 zen_key_org.go
+//     （按 key 向 console/api/orgs 发现 + 负缓存）；发现不到则省略该头，并在
+//     管理员显式配置 cfg.OrgID 时回退到该值。绝不编造。
 //   - x-opencode-project：网关没有客户端项目目录，global 是唯一诚实值。
-func setZenGateHeaders(req *http.Request, sess, requestID string) {
+//
+// key 是本次请求实际使用的那把 key（轮转/故障转移后可能不是 Keys[0]）——
+// 按它解析该 key 自己的 org，才能保证"头里的 org 就是这把 key 的 org"。
+// key 为空（匿名路径）时不发该头，除非管理员显式配置了 cfg.OrgID 兜底。
+func setZenGateHeaders(req *http.Request, sess, requestID, key string) {
 	_ = requestID // v2 CLI does not send x-opencode-request; do not emit it
 	req.Header["x-opencode-session-id"] = []string{sess}
 	req.Header["x-opencode-session"] = []string{sess}
@@ -1883,7 +1897,12 @@ func setZenGateHeaders(req *http.Request, sess, requestID string) {
 	req.Header["x-session-id"] = []string{sess}
 	req.Header["x-opencode-client"] = []string{"cli"}
 	req.Header["x-opencode-project"] = []string{"global"}
-	if org := getZenConfig().OrgID; org != "" {
+	if key != "" {
+		if org, _ := zenKeyOrgForRequest(key); org != "" {
+			req.Header["x-opencode-org-id"] = []string{org}
+		}
+	} else if org := strings.TrimSpace(getZenConfig().OrgID); org != "" {
+		// 无 key（匿名路径）：只有显式配置的值可用。
 		req.Header["x-opencode-org-id"] = []string{org}
 	}
 	// CLI v2 wire headers (2026-10-26 capture): Accept */*, and the
@@ -2540,7 +2559,7 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 		req.Header.Set("User-Agent", ua)
 		// x-opencode-session-id：真实 CLI 两个头都发（request.ts）；对本仓库的
 		// 格式门结论无害，补上只为字节级对齐官方流量。
-		setZenGateHeaders(req, sess, user)
+		setZenGateHeaders(req, sess, user, key)
 		log.Printf("  zen upstream: model=%s responses stream=%v via=%s key=#%d attempt=%d session=%s",
 			zm.ID, stream, viaProxy, keyIndex(key), attempt+1, kit.Truncate(sess, 24))
 
@@ -2854,7 +2873,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", ua)
 		// x-opencode-session-id：真实 CLI 两个头都发（request.ts），见 responses 路径。
-		setZenGateHeaders(req, sess, user)
+		setZenGateHeaders(req, sess, user, key)
 
 		log.Printf("  zen upstream: model=%s stream=%v msgs=%d via=%s key=#%d attempt=%d session=%s",
 			body["model"], stream, getMsgCount(params), viaProxy, keyIndex(key), attempt+1, kit.Truncate(sess, 24))

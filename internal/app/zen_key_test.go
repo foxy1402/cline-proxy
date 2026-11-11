@@ -590,7 +590,7 @@ func TestSetZenGateHeadersContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setZenGateHeaders(req, "ses_abc123", "msg_xyz789")
+	setZenGateHeaders(req, "ses_abc123", "msg_xyz789", "")
 	want := map[string]string{
 		"x-opencode-session-id": "ses_abc123",
 		"x-opencode-session":    "ses_abc123",
@@ -629,7 +629,7 @@ func TestSetZenGateHeadersOrgID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setZenGateHeaders(req, "ses_abc123", "")
+	setZenGateHeaders(req, "ses_abc123", "", "")
 	if got := req.Header["x-opencode-org-id"]; len(got) != 1 || got[0] != "wrk_test_org_123" {
 		t.Fatalf("x-opencode-org-id = %v, want [wrk_test_org_123]", got)
 	}

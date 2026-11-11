@@ -91,7 +91,7 @@ func TestSetZenGateHeadersB3HasParentSpan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setZenGateHeaders(req, "ses_aabbccddeeff0123456789ABCD", "msg_x")
+	setZenGateHeaders(req, "ses_aabbccddeeff0123456789ABCD", "msg_x", "")
 
 	b3 := req.Header.Get("b3")
 	if b3 == "" {

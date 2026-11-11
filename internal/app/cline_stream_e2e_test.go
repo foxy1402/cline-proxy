@@ -422,7 +422,7 @@ func TestZenHeadersMatchAuditSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setZenGateHeaders(req, "ses_abcdef012345ABCDef012345", "msg_abcdefghijklmnopqrstuvwxyz12")
+	setZenGateHeaders(req, "ses_abcdef012345ABCDef012345", "msg_abcdefghijklmnopqrstuvwxyz12", "")
 	// 官方 CLI 发小写键名；raw map 必须是小写条目
 	for k, v := range map[string]string{
 		"x-opencode-session-id": "ses_abcdef012345ABCDef012345",

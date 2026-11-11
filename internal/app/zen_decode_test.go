@@ -30,7 +30,7 @@ func TestCompressedUpstreamBodyIsDecoded(t *testing.T) {
 	defer srv.Close()
 
 	req, _ := http.NewRequest("POST", srv.URL, strings.NewReader("{}"))
-	setZenGateHeaders(req, "ses_0123456789abAAAAAAAAAAAAAA", "msg_0123456789ab")
+	setZenGateHeaders(req, "ses_0123456789abAAAAAAAAAAAAAA", "msg_0123456789ab", "")
 	if req.Header.Get("Accept-Encoding") == "" {
 		t.Fatal("precondition: gateway must advertise Accept-Encoding")
 	}

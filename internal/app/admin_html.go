@@ -566,8 +566,8 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <select id="ocProbeModel" style="max-width:300px"><option value="">auto — big-pickle first, then live models</option></select>
       <label class="hint" style="margin:0 0 0 6px">Session rotation (min):</label>
       <input type="text" id="ocSessionRotate" placeholder="120" style="max-width:90px" title="Legacy: sticky-session rotation interval. Sessions are minted per API call since 2026-10-27, so the rotator is disabled and this value is inert.">
-      <label class="hint" style="margin:0 0 0 6px">Org ID:</label>
-      <input type="text" id="ocOrgID" placeholder="wrk_… (optional)" style="max-width:220px" title="OAuth account org id, sent as x-opencode-org-id. Only needed when the key is an OAuth token rather than a raw API key; leave empty to omit the header.">
+      <label class="hint" style="margin:0 0 0 6px">Org ID fallback:</label>
+      <input type="text" id="ocOrgID" placeholder="empty = per-key only" style="max-width:220px" title="Fallback org id for x-opencode-org-id. Each key's own org id is discovered automatically from console/api/orgs; this value is only used when discovery fails for that key. Leave empty to omit the header in that case. There is no single global org id — never put one key's org here and apply it to all keys.">
     </div>
     <p class="hint" style="margin-top:0">Session IDs are minted locally, one per API call, and match the upstream's format gate (<code>^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$</code>) — no CLI or harvester involved. The sticky-session table below is informational only; upstream calls no longer reuse a session across requests.</p>
     <div class="form-row">
@@ -579,8 +579,8 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <p class="hint" style="margin-top:0">opencode zen records the egress IP per key and treats a key seen from several IPs as suspicious, so each key is pinned to one proxy by default, and keys that got no proxy are skipped — they would otherwise leak an extra IP. One proxy serves one identity per upstream; Cline accounts get the same treatment when the Cline pool uses proxies. Turn this off only for troubleshooting.</p>
     <div class="table-wrap" style="margin-bottom:10px">
       <table>
-        <thead><tr><th style="width:44px">#</th><th style="width:100px">Key</th><th style="width:60px">Usage</th><th style="width:150px">Egress</th><th style="width:160px">Session</th><th style="width:110px">Rotates</th><th>Cooldown</th><th style="width:84px"></th></tr></thead>
-        <tbody id="ocKeysBody"><tr><td colspan="8" class="empty">Loading...</td></tr></tbody>
+        <thead><tr><th style="width:44px">#</th><th style="width:100px">Key</th><th style="width:60px">Usage</th><th style="width:150px">Egress</th><th style="width:150px">Org</th><th style="width:160px">Session</th><th style="width:110px">Rotates</th><th>Cooldown</th><th style="width:84px"></th></tr></thead>
+        <tbody id="ocKeysBody"><tr><td colspan="9" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
     <div class="form-row">
@@ -1456,16 +1456,26 @@ function renderOcKeyStates(ks) {
         } else if (k.proxy === 'rotating (no key)') {
           eg = '<span style="color:var(--text2)" title="anonymous requests have no key to bind">rotating</span>';
         }
+        // 每 key org id：上游 x-opencode-org-id 的真实来源。未解析时该头省略，
+        // 面板必须能区分"没解析出来"与"解析到了别的值"。
+        let orgCell = '<span style="color:var(--text2)" title="not resolved yet — the header is omitted for this key (resolved on first request)">-</span>';
+        if (k.orgID) {
+          const fb = k.orgSource === 'config-fallback';
+          orgCell = '<span class="mono" style="font-size:11px' + (fb ? ';color:var(--warning,#c60)' : '') + '" title="' +
+            (fb ? 'discovery returned nothing for this key; using the configured fallback' : 'discovered from console/api/orgs') + '">' +
+            esc(k.orgID) + (fb ? ' (fallback)' : '') + '</span>';
+        }
         return '<tr><td>#' + (k.index + 1) + (k.current ? ' <span style="color:var(--accent)" title="next in rotation">●</span>' : '') + '</td>' +
           '<td style="font-family:monospace;font-size:11px">' + esc(k.keyMask) + '</td>' +
           '<td>' + (k.usage || 0) + '</td>' +
           '<td>' + eg + '</td>' +
+          '<td>' + orgCell + '</td>' +
           '<td>' + sess + '</td>' +
           '<td>' + rot + '</td>' +
           '<td>' + cool + '</td>' +
           '<td>' + (k.keyMask === 'public (no key)' ? '' : '<button class="btn btn-sm" data-zk="' + k.index + '">Test</button>') + '</td></tr>';
       }).join('')
-    : '<tr><td colspan="8" class="empty">No zen keys configured</td></tr>';
+    : '<tr><td colspan="9" class="empty">No zen keys configured</td></tr>';
   tb.onclick = e => {
     const b = e.target.closest('button[data-zk]');
     if (b) testZenKey(parseInt(b.dataset.zk, 10), b);
