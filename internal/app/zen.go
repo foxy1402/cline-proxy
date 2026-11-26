@@ -2537,7 +2537,9 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 		// retries of this call, fresh for a new call / new key.
 		sess, user, ua := callIdent.forKey(key)
 		body := buildZenResponsesBody(params, zm.ID, sess)
-		bodyJSON, err := json.Marshal(body)
+		// 上游 body 用客户端字节形态序列化（不转义 <>&、固定键序）——见
+		// kit.MarshalWireJSON 注释。响应方向（chat 聚合、日志）仍用标准 marshal。
+		bodyJSON, err := kit.MarshalWireJSON(body)
 		if err != nil {
 			return nil, rateLimited, fmt.Errorf("marshal zen responses body: %w", err)
 		}
@@ -2714,7 +2716,7 @@ func callZenResponsesAPI(ctx context.Context, params map[string]any, stream bool
 				remapped = true
 				// params["model"] 已改写为继任模型；重建 body 后就地重试。
 				body = buildZenResponsesBody(params, params["model"].(string), sess)
-				bodyJSON, err = json.Marshal(body)
+				bodyJSON, err = kit.MarshalWireJSON(body)
 				if err != nil {
 					return nil, rateLimited, fmt.Errorf("marshal zen responses body: %w", err)
 				}
@@ -2745,7 +2747,9 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 	cfg := getZenConfig()
 	body := buildZenBody(params, stream)
 
-	bodyJSON, err := json.Marshal(body)
+	// 上游 body 用客户端字节形态序列化（不转义 <>&、固定键序）——见
+	// kit.MarshalWireJSON 注释。响应方向（chat 聚合、日志）仍用标准 marshal。
+	bodyJSON, err := kit.MarshalWireJSON(body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("marshal zen body: %w", err)
 	}
@@ -3028,7 +3032,7 @@ func callZenAPI(ctx context.Context, params map[string]any, stream bool, opts ..
 			if migrated := zenHandleDeprecatedModel(resp.StatusCode, bodyBytes, body["model"].(string), params, o.pinKey != "", remapped); migrated {
 				remapped = true
 				body = buildZenBody(params, stream)
-				bodyJSON, err = json.Marshal(body)
+				bodyJSON, err = kit.MarshalWireJSON(body)
 				if err != nil {
 					return nil, rateLimited, fmt.Errorf("marshal zen body: %w", err)
 				}
